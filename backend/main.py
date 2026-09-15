@@ -1,13 +1,53 @@
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
+import sqlite3
+import json
 
 
 app = FastAPI(
     title="AI Workforce Platform",
-    version="0.2.0",
+    version="0.3.0",
     description="AI workforce task planning and execution API"
 )
+
+
+# =========================
+# Database
+# =========================
+
+DATABASE = "workforce.db"
+
+
+def get_db():
+    connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def init_db():
+    connection = get_db()
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            assigned_to TEXT,
+            status TEXT DEFAULT 'pending',
+            priority TEXT DEFAULT 'medium',
+            dependencies TEXT DEFAULT '[]',
+            result TEXT
+        )
+        """
+    )
+
+    connection.commit()
+    connection.close()
+
+
+init_db()
 
 
 # =========================
@@ -31,12 +71,12 @@ class Task(BaseModel):
     assigned_to: Optional[str] = None
     status: str = "pending"
     priority: str = "medium"
-    dependencies: List[str] = []
+    dependencies: List[str] = Field(default_factory=list)
     result: Optional[str] = None
 
 
 # =========================
-# In-memory storage
+# AI Employees
 # =========================
 
 employees_db = [
@@ -67,32 +107,99 @@ employees_db = [
     )
 ]
 
-tasks_db = []
+
+# =========================
+# Helper Functions
+# =========================
+
+def row_to_task(row):
+    return Task(
+        id=row["id"],
+        title=row["title"],
+        description=row["description"],
+        assigned_to=row["assigned_to"],
+        status=row["status"],
+        priority=row["priority"],
+        dependencies=json.loads(row["dependencies"]),
+        result=row["result"]
+    )
+
+
+def save_task(task: Task):
+    connection = get_db()
+
+    connection.execute(
+        """
+        INSERT OR REPLACE INTO tasks
+        (id, title, description, assigned_to, status,
+         priority, dependencies, result)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task.id,
+            task.title,
+            task.description,
+            task.assigned_to,
+            task.status,
+            task.priority,
+            json.dumps(task.dependencies),
+            task.result
+        )
+    )
+
+    connection.commit()
+    connection.close()
+
+
+def get_task_from_db(task_id: str):
+    connection = get_db()
+
+    row = connection.execute(
+        "SELECT * FROM tasks WHERE id = ?",
+        (task_id,)
+    ).fetchone()
+
+    connection.close()
+
+    if row:
+        return row_to_task(row)
+
+    return None
 
 
 # =========================
-# Basic endpoints
+# Basic Endpoints
 # =========================
 
 @app.get("/")
 def home():
     return {
         "message": "AI Workforce Platform is running",
-        "version": "0.2.0"
+        "version": "0.3.0",
+        "database": "SQLite"
     }
 
 
 @app.get("/health")
 def health():
+    connection = get_db()
+
+    task_count = connection.execute(
+        "SELECT COUNT(*) FROM tasks"
+    ).fetchone()[0]
+
+    connection.close()
+
     return {
         "status": "healthy",
         "employees": len(employees_db),
-        "tasks": len(tasks_db)
+        "tasks": task_count,
+        "database": "connected"
     }
 
 
 # =========================
-# Employee endpoints
+# Employee Endpoints
 # =========================
 
 @app.get("/employees")
@@ -123,6 +230,7 @@ def create_plan(request: PlanRequest):
     goal = request.goal.lower()
 
     if "sales" in goal or "meeting" in goal or "customer" in goal:
+
         task_data = [
             (
                 "Find potential customers",
@@ -169,6 +277,7 @@ def create_plan(request: PlanRequest):
         ]
 
     else:
+
         task_data = [
             (
                 "Understand the goal",
@@ -220,6 +329,7 @@ def create_plan(request: PlanRequest):
         task_data,
         start=1
     ):
+
         task = Task(
             id=f"TASK-{index:03d}",
             title=title,
@@ -230,7 +340,7 @@ def create_plan(request: PlanRequest):
             dependencies=dependencies
         )
 
-        tasks_db.append(task)
+        save_task(task)
         created_tasks.append(task)
 
     return {
@@ -244,23 +354,35 @@ def create_plan(request: PlanRequest):
 
 
 # =========================
-# Task endpoints
+# Task Endpoints
 # =========================
 
 @app.get("/tasks")
 def get_tasks():
+
+    connection = get_db()
+
+    rows = connection.execute(
+        "SELECT * FROM tasks ORDER BY rowid"
+    ).fetchall()
+
+    connection.close()
+
+    tasks = [row_to_task(row) for row in rows]
+
     return {
-        "total_tasks": len(tasks_db),
-        "tasks": tasks_db
+        "total_tasks": len(tasks),
+        "tasks": tasks
     }
 
 
 @app.get("/tasks/{task_id}")
 def get_task(task_id: str):
 
-    for task in tasks_db:
-        if task.id == task_id:
-            return task
+    task = get_task_from_db(task_id)
+
+    if task:
+        return task
 
     return {
         "error": "Task not found",
@@ -271,64 +393,79 @@ def get_task(task_id: str):
 @app.post("/tasks/{task_id}/execute")
 def execute_task(task_id: str):
 
-    for task in tasks_db:
+    task = get_task_from_db(task_id)
 
-        if task.id == task_id:
+    if not task:
+        return {
+            "error": "Task not found",
+            "task_id": task_id
+        }
 
-            # Check dependencies
-            for dependency_id in task.dependencies:
+    # Check dependencies
+    for dependency_id in task.dependencies:
 
-                dependency = next(
-                    (item for item in tasks_db if item.id == dependency_id),
-                    None
-                )
+        dependency = get_task_from_db(dependency_id)
 
-                if dependency and dependency.status != "completed":
-                    return {
-                        "message": "Task is waiting for dependency",
-                        "task": task,
-                        "blocked_by": dependency_id
-                    }
-
-            task.status = "running"
-
-            # Phase 1 simulation:
-            # Real AI execution will be added in a later phase.
-            task.result = (
-                f"{task.assigned_to} executed task: {task.title}"
-            )
-
-            task.status = "completed"
-
+        if dependency and dependency.status != "completed":
             return {
-                "message": "Task executed successfully",
+                "message": "Task is waiting for dependency",
                 "task": task,
-                "result": task.result
+                "blocked_by": dependency_id
             }
 
+    task.status = "running"
+    save_task(task)
+
+    # Phase 2 simulation.
+    # Real AI execution will be added later.
+    task.result = (
+        f"{task.assigned_to} executed task: {task.title}"
+    )
+
+    task.status = "completed"
+    save_task(task)
+
     return {
-        "error": "Task not found",
-        "task_id": task_id
+        "message": "Task executed successfully",
+        "task": task,
+        "result": task.result
     }
 
 
 # =========================
-# Workforce status
+# Workforce Status
 # =========================
 
 @app.get("/workforce")
 def workforce_status():
 
-    pending = sum(1 for task in tasks_db if task.status == "pending")
-    running = sum(1 for task in tasks_db if task.status == "running")
-    completed = sum(1 for task in tasks_db if task.status == "completed")
+    connection = get_db()
+
+    total = connection.execute(
+        "SELECT COUNT(*) FROM tasks"
+    ).fetchone()[0]
+
+    pending = connection.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'pending'"
+    ).fetchone()[0]
+
+    running = connection.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+    ).fetchone()[0]
+
+    completed = connection.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'completed'"
+    ).fetchone()[0]
+
+    connection.close()
 
     return {
         "employees": len(employees_db),
         "tasks": {
-            "total": len(tasks_db),
+            "total": total,
             "pending": pending,
             "running": running,
             "completed": completed
-        }
+        },
+        "database": "SQLite"
     }
