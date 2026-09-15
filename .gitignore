@@ -7,3 +7,7 @@ __pycache__/
 *.db
 *.sqlite
 .DS_Store
+
+*.phase0
+*.phase1
+*.phase2-backup
