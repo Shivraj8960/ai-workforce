@@ -1,0 +1,135 @@
+import os
+from typing import Dict
+
+from dotenv import load_dotenv
+from openai import OpenAI
+
+
+load_dotenv(".env")
+
+
+AGENT_CONFIG = {
+    "researcher": {
+        "role": "Researcher",
+        "instruction": (
+            "Research the task carefully. Identify useful information, "
+            "opportunities, facts, and relevant findings."
+        ),
+    },
+    "analyst": {
+        "role": "Analyst",
+        "instruction": (
+            "Analyze the task and available information. Identify patterns, "
+            "important findings, risks, and useful conclusions."
+        ),
+    },
+    "writer": {
+        "role": "Writer",
+        "instruction": (
+            "Create clear, professional, and useful written content "
+            "based on the task requirements."
+        ),
+    },
+    "reviewer": {
+        "role": "Reviewer",
+        "instruction": (
+            "Review the task carefully for quality, accuracy, completeness, "
+            "and potential improvements."
+        ),
+    },
+    "executor": {
+        "role": "Executor",
+        "instruction": (
+            "Execute the approved operational task according to the "
+            "requirements and workflow."
+        ),
+    },
+}
+
+
+def execute_agent(
+    agent: str,
+    task_title: str,
+    task_description: str,
+) -> Dict:
+
+    agent_key = agent.lower().strip()
+
+    config = AGENT_CONFIG.get(agent_key)
+
+    if not config:
+        return {
+            "agent": agent_key,
+            "task": task_title,
+            "status": "failed",
+            "result": f"Unknown agent: {agent}",
+        }
+
+    api_key = os.getenv("INCEPTION_API_KEY")
+
+    if not api_key:
+        return {
+            "agent": agent_key,
+            "task": task_title,
+            "status": "failed",
+            "result": "INCEPTION_API_KEY is not configured.",
+        }
+
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.inceptionlabs.ai/v1",
+        )
+
+        prompt = f"""
+You are the {config['role']} in an AI Workforce system.
+
+Your role:
+{config['instruction']}
+
+Task title:
+{task_title}
+
+Task description:
+{task_description}
+
+Perform the task and provide a useful result.
+Be clear, structured, and practical.
+"""
+
+        response = client.chat.completions.create(
+            model="mercury-2",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            max_tokens=1000,
+            reasoning_effort="instant",
+        )
+
+        content = response.choices[0].message.content
+
+        if not content:
+            return {
+                "agent": agent_key,
+                "task": task_title,
+                "status": "failed",
+                "result": "AI returned an empty response.",
+            }
+
+        return {
+            "agent": agent_key,
+            "task": task_title,
+            "status": "completed",
+            "result": content,
+        }
+
+    except Exception as e:
+        return {
+            "agent": agent_key,
+            "task": task_title,
+            "status": "failed",
+            "result": f"AI execution failed: {str(e)}",
+        }

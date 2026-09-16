@@ -74,6 +74,8 @@ class Task(BaseModel):
     priority: str = "medium"
     dependencies: List[str] = Field(default_factory=list)
     result: Optional[str] = None
+    approval_status: str = "not_required"
+    approval_status: str = "not_required"
 
 
 # =========================
@@ -122,7 +124,8 @@ def row_to_task(row):
         status=row["status"],
         priority=row["priority"],
         dependencies=json.loads(row["dependencies"]),
-        result=row["result"]
+        result=row["result"],
+        approval_status=row["approval_status"],
     )
 
 
@@ -133,8 +136,8 @@ def save_task(task: Task):
         """
         INSERT OR REPLACE INTO tasks
         (id, title, description, assigned_to, status,
-         priority, dependencies, result)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         priority, dependencies, result, approval_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task.id,
@@ -144,7 +147,8 @@ def save_task(task: Task):
             task.status,
             task.priority,
             json.dumps(task.dependencies),
-            task.result
+            task.result,
+        task.approval_status,
         )
     )
 
@@ -426,11 +430,15 @@ def execute_task(task_id: str):
 
     task.result = execution["result"]
 
-    task.status = "completed"
+    if execution["status"] == "completed":
+        task.status = "completed"
+    else:
+        task.status = "failed"
+    
     save_task(task)
 
     return {
-        "message": "Task executed successfully",
+        "message": "Task executed successfully" if task.status == "completed" else "Task execution failed",
         "task": task,
         "result": task.result
     }
@@ -472,4 +480,54 @@ def workforce_status():
             "completed": completed
         },
         "database": "SQLite"
+    }
+@app.post("/workforce/run")
+def run_workforce():
+    executed = []
+    failed = []
+    blocked = []
+
+    while True:
+        progress = False
+        tasks = get_tasks()["tasks"]
+
+        for task in tasks:
+            if task.status != "pending":
+                continue
+
+            dependencies_ready = True
+
+            for dependency_id in task.dependencies:
+                dependency = get_task_from_db(dependency_id)
+
+                if not dependency or dependency.status != "completed":
+                    dependencies_ready = False
+                    break
+
+            if not dependencies_ready:
+                continue
+
+            response = execute_task(task.id)
+            updated_task = get_task_from_db(task.id)
+
+            if updated_task:
+                if updated_task.status == "completed":
+                    executed.append(task.id)
+                elif updated_task.status == "failed":
+                    failed.append(task.id)
+
+            progress = True
+
+        if not progress:
+            break
+
+    for task in get_tasks()["tasks"]:
+        if task.status == "pending":
+            blocked.append(task.id)
+
+    return {
+        "message": "Workforce execution completed",
+        "executed": executed,
+        "failed": failed,
+        "blocked": blocked,
     }
