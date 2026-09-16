@@ -13,3 +13,6 @@ __pycache__/
 *.phase2-backup
 
 *.phase3-backup
+
+*.phase5-backup
+*.phase6-backup

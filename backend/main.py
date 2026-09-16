@@ -75,6 +75,7 @@ class Task(BaseModel):
     dependencies: List[str] = Field(default_factory=list)
     result: Optional[str] = None
     approval_status: str = "not_required"
+    provider: Optional[str] = None
     approval_status: str = "not_required"
 
 
@@ -126,6 +127,7 @@ def row_to_task(row):
         dependencies=json.loads(row["dependencies"]),
         result=row["result"],
         approval_status=row["approval_status"],
+        provider=row["provider"],
     )
 
 
@@ -136,8 +138,8 @@ def save_task(task: Task):
         """
         INSERT OR REPLACE INTO tasks
         (id, title, description, assigned_to, status,
-         priority, dependencies, result, approval_status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         priority, dependencies, result, approval_status, provider)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task.id,
@@ -149,6 +151,7 @@ def save_task(task: Task):
             json.dumps(task.dependencies),
             task.result,
         task.approval_status,
+            task.provider,
         )
     )
 
@@ -411,7 +414,7 @@ def execute_task(task_id: str):
 
         dependency = get_task_from_db(dependency_id)
 
-        if dependency and dependency.status != "completed":
+        if dependency and dependency.status != "completed" and dependency.approval_status != "approved":
             return {
                 "message": "Task is waiting for dependency",
                 "task": task,
