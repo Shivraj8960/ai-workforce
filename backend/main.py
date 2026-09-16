@@ -1,3 +1,4 @@
+from agent_executor import execute_agent
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from typing import Optional, List
@@ -416,11 +417,14 @@ def execute_task(task_id: str):
     task.status = "running"
     save_task(task)
 
-    # Phase 2 simulation.
-    # Real AI execution will be added later.
-    task.result = (
-        f"{task.assigned_to} executed task: {task.title}"
+    # Phase 3 agent execution.
+    execution = execute_agent(
+        task.assigned_to,
+        task.title,
+        task.description,
     )
+
+    task.result = execution["result"]
 
     task.status = "completed"
     save_task(task)
