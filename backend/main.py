@@ -445,6 +445,49 @@ def execute_task(task_id: str):
 
 
 # =========================
+# ============================
+# Human Approval
+# ============================
+
+@app.post("/tasks/{task_id}/approve")
+def approve_task(task_id: str):
+    task = get_task_from_db(task_id)
+
+    if not task:
+        return {
+            "error": "Task not found",
+            "task_id": task_id
+        }
+
+    task.approval_status = "approved"
+    save_task(task)
+
+    return {
+        "message": "Task approved",
+        "task": task
+    }
+
+
+@app.post("/tasks/{task_id}/reject")
+def reject_task(task_id: str):
+    task = get_task_from_db(task_id)
+
+    if not task:
+        return {
+            "error": "Task not found",
+            "task_id": task_id
+        }
+
+    task.approval_status = "rejected"
+    task.status = "failed"
+    save_task(task)
+
+    return {
+        "message": "Task rejected",
+        "task": task
+    }
+
+
 # Workforce Status
 # =========================
 
