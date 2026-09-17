@@ -1,4 +1,4 @@
-from agent_executor import execute_agent
+from agent_executor import execute_agent, generate_plan
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from typing import Optional, List
@@ -234,115 +234,29 @@ def create_employee(employee: Employee):
 
 @app.post("/plan")
 def create_plan(request: PlanRequest):
+    try:
+        raw_plan = generate_plan(request.goal)
+        planned_tasks = json.loads(raw_plan)
+    except Exception as e:
+        return {"goal": request.goal, "status": "planning_failed", "error": str(e)}
 
-    goal = request.goal.lower()
-
-    if "sales" in goal or "meeting" in goal or "customer" in goal:
-
-        task_data = [
-            (
-                "Find potential customers",
-                "Identify potential customers matching the target profile",
-                "Researcher",
-                []
-            ),
-            (
-                "Research and qualify prospects",
-                "Research prospects and determine whether they are qualified",
-                "Analyst",
-                ["TASK-001"]
-            ),
-            (
-                "Prepare personalized outreach",
-                "Create personalized outreach messages for qualified prospects",
-                "Writer",
-                ["TASK-002"]
-            ),
-            (
-                "Request human approval",
-                "Send prepared outreach for human approval before external action",
-                "Reviewer",
-                ["TASK-003"]
-            ),
-            (
-                "Send approved outreach",
-                "Send only the outreach that has received human approval",
-                "Executor",
-                ["TASK-004"]
-            ),
-            (
-                "Track responses",
-                "Track prospect responses and engagement",
-                "Analyst",
-                ["TASK-005"]
-            ),
-            (
-                "Update results",
-                "Summarize outcomes and update the workforce results",
-                "Reviewer",
-                ["TASK-006"]
-            )
-        ]
-
-    else:
-
-        task_data = [
-            (
-                "Understand the goal",
-                "Break the user's goal into actionable requirements",
-                "Researcher",
-                []
-            ),
-            (
-                "Analyze requirements",
-                "Analyze the requirements and determine the best approach",
-                "Analyst",
-                ["TASK-001"]
-            ),
-            (
-                "Prepare execution plan",
-                "Create a detailed plan for completing the goal",
-                "Writer",
-                ["TASK-002"]
-            ),
-            (
-                "Review plan",
-                "Review the plan before execution",
-                "Reviewer",
-                ["TASK-003"]
-            ),
-            (
-                "Execute approved plan",
-                "Execute the approved actions",
-                "Executor",
-                ["TASK-004"]
-            ),
-            (
-                "Analyze results",
-                "Analyze the execution results",
-                "Analyst",
-                ["TASK-005"]
-            ),
-            (
-                "Finalize results",
-                "Prepare the final result and summary",
-                "Reviewer",
-                ["TASK-006"]
-            )
-        ]
+    if not isinstance(planned_tasks, list) or not 3 <= len(planned_tasks) <= 7:
+        return {"goal": request.goal, "status": "planning_failed", "error": "AI planner must return between 3 and 7 tasks"}
 
     created_tasks = []
 
-    for index, (title, description, assigned_to, dependencies) in enumerate(
-        task_data,
-        start=1
-    ):
+    for index, item in enumerate(planned_tasks, start=1):
+        required = ["title", "description", "assigned_to", "dependencies"]
+        if not all(key in item for key in required):
+            return {"goal": request.goal, "status": "planning_failed", "error": "AI planner returned an invalid task format"}
+
+        dependencies = [f"TASK-{int(dep):03d}" for dep in item["dependencies"]]
 
         task = Task(
             id=f"TASK-{index:03d}",
-            title=title,
-            description=description,
-            assigned_to=assigned_to,
+            title=item["title"],
+            description=item["description"],
+            assigned_to=item["assigned_to"],
             status="pending",
             priority="medium",
             dependencies=dependencies
@@ -359,11 +273,6 @@ def create_plan(request: PlanRequest):
             "tasks": created_tasks
         }
     }
-
-
-# =========================
-# Task Endpoints
-# =========================
 
 @app.get("/tasks")
 def get_tasks():
@@ -471,6 +380,7 @@ def approve_task(task_id: str):
         }
 
     task.approval_status = "approved"
+    task.status = "completed"
     save_task(task)
 
     return {

@@ -155,6 +155,32 @@ def execute_with_ollama(prompt):
     return content
 
 
+def generate_plan(goal):
+    prompt = f"""You are the planning engine of an AI Workforce system.
+
+User goal:
+{goal}
+
+Create a practical workflow of 3 to 7 tasks. Return ONLY valid JSON as a list. Each task must contain exactly these fields:
+- title: short task name
+- description: clear task description
+- assigned_to: one of Researcher, Analyst, Writer, Reviewer, Executor
+- dependencies: list of previous task numbers, using integers starting from 1
+
+Example format:
+[{{"title":"Research market","description":"Identify relevant market information","assigned_to":"Researcher","dependencies":[]}}]
+
+Do not include markdown or explanations."""
+    try:
+        result = execute_with_mercury(prompt)
+        return result
+    except Exception as mercury_error:
+        try:
+            return execute_with_ollama(prompt)
+        except Exception as ollama_error:
+            raise RuntimeError(f"Both planning providers failed. Mercury: {mercury_error}; Ollama: {ollama_error}")
+
+
 def execute_agent(
     agent: str,
     task_title: str,
