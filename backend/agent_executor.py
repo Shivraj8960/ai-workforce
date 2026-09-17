@@ -13,36 +13,62 @@ AGENT_CONFIG = {
     "researcher": {
         "role": "Researcher",
         "instruction": (
-            "Research the task carefully. Identify useful information, "
-            "opportunities, facts, and relevant findings."
+            "Investigate the task systematically. Gather relevant facts, "
+            "opportunities, assumptions, and useful evidence. Separate known "
+            "facts from assumptions and identify information that is still missing."
+        ),
+        "output": (
+            "Return a concise research report with key findings, useful evidence, "
+            "assumptions, gaps, and actionable next steps."
         ),
     },
     "analyst": {
         "role": "Analyst",
         "instruction": (
-            "Analyze the task and available information. Identify patterns, "
-            "important findings, risks, and useful conclusions."
+            "Analyze the available task information and research. Identify "
+            "patterns, relationships, risks, trade-offs, priorities, and "
+            "practical conclusions. Do not invent missing data."
+        ),
+        "output": (
+            "Return structured analysis with findings, reasoning, risks, "
+            "priorities, and clear conclusions."
         ),
     },
     "writer": {
         "role": "Writer",
         "instruction": (
-            "Create clear, professional, and useful written content "
-            "based on the task requirements."
+            "Transform the available information into clear, professional, "
+            "well-structured content appropriate for the requested task. "
+            "Preserve important facts and avoid unsupported claims."
+        ),
+        "output": (
+            "Return a polished deliverable using headings, bullets, tables, "
+            "or other formatting when useful."
         ),
     },
     "reviewer": {
         "role": "Reviewer",
         "instruction": (
-            "Review the task carefully for quality, accuracy, completeness, "
-            "and potential improvements."
+            "Critically inspect the available work for accuracy, completeness, "
+            "clarity, consistency, risks, and missing requirements. Identify "
+            "specific issues and explain how each should be improved."
+        ),
+        "output": (
+            "Return a review containing strengths, issues, missing items, "
+            "recommended corrections, and a final readiness assessment."
         ),
     },
     "executor": {
         "role": "Executor",
         "instruction": (
-            "Execute the approved operational task according to the "
-            "requirements and workflow."
+            "Work only from approved requirements. Convert the task into "
+            "concrete execution steps, expected outputs, dependencies, and "
+            "verification checks. Do not claim an external action was performed "
+            "when the system cannot actually perform it."
+        ),
+        "output": (
+            "Return an execution result containing actions, expected outputs, "
+            "verification status, and any blockers."
         ),
     },
 }
@@ -61,8 +87,15 @@ Task title:
 Task description:
 {task_description}
 
-Perform the task and provide a useful result.
-Be clear, structured, and practical.
+Required output:
+{config['output']}
+
+General rules:
+- Stay focused on the assigned task.
+- Be clear, structured, and practical.
+- Do not invent facts, sources, actions, or results.
+- Clearly identify assumptions or missing information.
+- Produce an output that can be passed to the next employee in the workflow.
 """
 
 

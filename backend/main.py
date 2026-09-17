@@ -421,6 +421,13 @@ def execute_task(task_id: str):
                 "blocked_by": dependency_id
             }
 
+    # Gather completed dependency results for agent-to-agent context.
+    previous_results = []
+    for dependency_id in task.dependencies:
+        dependency = get_task_from_db(dependency_id)
+        if dependency and dependency.result:
+            previous_results.append(f"Previous task {dependency.id} ({dependency.title}):\n{dependency.result}")
+
     task.status = "running"
     save_task(task)
 
@@ -428,10 +435,11 @@ def execute_task(task_id: str):
     execution = execute_agent(
         task.assigned_to,
         task.title,
-        task.description,
+        task.description + ("\n\nContext from completed previous tasks:\n" + "\n\n".join(previous_results) if previous_results else ""),
     )
 
     task.result = execution["result"]
+    task.provider = execution.get("provider")
 
     if execution["status"] == "completed":
         task.status = "completed"
