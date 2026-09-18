@@ -46,6 +46,18 @@ AGENT_CONFIG = {
             "or other formatting when useful."
         ),
     },
+    "designer": {
+        "role": "Designer",
+        "instruction": (
+            "Create clear design concepts, wireframes, layouts, and user experience "
+            "recommendations based on the task requirements. Focus on usability, "
+            "visual hierarchy, consistency, and practical implementation."
+        ),
+        "output": (
+            "Return a structured design specification containing layout ideas, "
+            "key components, user flow, visual guidance, and implementation notes."
+        ),
+    },
     "reviewer": {
         "role": "Reviewer",
         "instruction": (
@@ -181,6 +193,35 @@ Do not include markdown or explanations."""
             raise RuntimeError(f"Both planning providers failed. Mercury: {mercury_error}; Ollama: {ollama_error}")
 
 
+def execute_with_gemini(prompt):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    )
+
+    response = client.chat.completions.create(
+        model="gemini-3.8-flash",
+        messages=[
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        max_tokens=1000,
+    )
+
+    content = response.choices[0].message.content
+
+    if not content:
+        raise RuntimeError("Gemini returned an empty response.")
+
+    return content
+
+
 def execute_agent(
     agent: str,
     task_title: str,
@@ -205,10 +246,9 @@ def execute_agent(
         task_description,
     )
 
-    # Primary AI provider
+    # Provider 1: Mercury 2
     try:
         result = execute_with_mercury(prompt)
-
         return {
             "agent": agent_key,
             "task": task_title,
@@ -216,31 +256,43 @@ def execute_agent(
             "provider": "inception-mercury-2",
             "result": result,
         }
-
     except Exception as mercury_error:
+        pass
 
-        # Local fallback AI provider
-        try:
-            result = execute_with_ollama(prompt)
+    # Provider 2: Gemini
+    try:
+        result = execute_with_gemini(prompt)
+        return {
+            "agent": agent_key,
+            "task": task_title,
+            "status": "completed",
+            "provider": "google-gemini-3.8-flash",
+            "result": result,
+        }
+    except Exception as gemini_error:
+        pass
 
-            return {
-                "agent": agent_key,
-                "task": task_title,
-                "status": "completed",
-                "provider": "ollama-llama3.2:3b",
-                "result": result,
-            }
+    # Provider 3: Ollama
+    try:
+        result = execute_with_ollama(prompt)
+        return {
+            "agent": agent_key,
+            "task": task_title,
+            "status": "completed",
+            "provider": "ollama-llama3.2:3b",
+            "result": result,
+        }
+    except Exception as ollama_error:
+        return {
+            "agent": agent_key,
+            "task": task_title,
+            "status": "failed",
+            "provider": None,
+            "result": (
+                "All AI providers failed.\n"
+                f"Mercury 2 error: {mercury_error}\n"
+                f"Gemini error: {gemini_error}\n"
+                f"Ollama error: {ollama_error}"
+            ),
+        }
 
-        except Exception as ollama_error:
-
-            return {
-                "agent": agent_key,
-                "task": task_title,
-                "status": "failed",
-                "provider": None,
-                "result": (
-                    "Both AI providers failed.\n"
-                    f"Mercury 2 error: {mercury_error}\n"
-                    f"Ollama error: {ollama_error}"
-                ),
-            }
