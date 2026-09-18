@@ -7,9 +7,9 @@ import json
 
 
 app = FastAPI(
-    title="AI Workforce Platform",
+    title="Nex AI Platform",
     version="0.3.0",
-    description="AI workforce task planning and execution API"
+    description="Nex AI task planning and execution API"
 )
 
 
@@ -182,7 +182,7 @@ def get_task_from_db(task_id: str):
 @app.get("/")
 def home():
     return {
-        "message": "AI Workforce Platform is running",
+        "message": "Nex AI Platform is running",
         "version": "0.3.0",
         "database": "SQLite"
     }

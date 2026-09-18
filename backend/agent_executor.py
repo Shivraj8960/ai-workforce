@@ -88,7 +88,7 @@ AGENT_CONFIG = {
 
 def build_prompt(config, task_title, task_description, previous_context=""):
     return f"""
-You are the {config['role']} in an AI Workforce system.
+You are the {config['role']} in an Nex AI system.
 
 Your role:
 {config['instruction']}
@@ -171,7 +171,7 @@ def execute_with_ollama(prompt):
 
 
 def generate_plan(goal):
-    prompt = f"""You are the planning engine of an AI Workforce system.
+    prompt = f"""You are the planning engine of an Nex AI system.
 
 User goal:
 {goal}
