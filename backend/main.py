@@ -464,7 +464,7 @@ def run_workforce():
             for dependency_id in task.dependencies:
                 dependency = get_task_from_db(dependency_id)
 
-                if not dependency or dependency.status != "completed":
+                if not dependency or (dependency.status != "completed" and dependency.approval_status != "approved"):
                     dependencies_ready = False
                     break
 
