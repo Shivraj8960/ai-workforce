@@ -86,7 +86,7 @@ AGENT_CONFIG = {
 }
 
 
-def build_prompt(config, task_title, task_description):
+def build_prompt(config, task_title, task_description, previous_context=""):
     return f"""
 You are the {config['role']} in an AI Workforce system.
 
@@ -98,6 +98,9 @@ Task title:
 
 Task description:
 {task_description}
+
+Previous agent context:
+{previous_context if previous_context else "None"}
 
 Required output:
 {config['output']}
@@ -226,6 +229,7 @@ def execute_agent(
     agent: str,
     task_title: str,
     task_description: str,
+    previous_context: str = "",
 ) -> Dict:
 
     agent_key = agent.lower().strip()
@@ -244,6 +248,7 @@ def execute_agent(
         config,
         task_title,
         task_description,
+        previous_context,
     )
 
     # Provider 1: Mercury 2
