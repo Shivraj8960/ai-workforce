@@ -1,4 +1,5 @@
 from agent_executor import execute_agent, generate_plan
+from self_healing import analyze_failure, should_retry, execute_with_retries
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from typing import Optional, List
@@ -341,13 +342,13 @@ def execute_task(task_id: str):
     save_task(task)
 
     # Phase 3 agent execution.
-    execution = execute_agent(
+    execution = execute_with_retries(execute_agent,
         task.assigned_to,
         task.title,
         task.description + ("\n\nContext from completed previous tasks:\n" + "\n\n".join(previous_results) if previous_results else ""),
     )
 
-    task.result = execution["result"]
+    task.result = json.dumps(execution)
     task.provider = execution.get("provider")
 
     if execution["status"] == "completed":
