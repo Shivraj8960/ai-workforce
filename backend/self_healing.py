@@ -53,6 +53,8 @@ def execute_with_retries(execute_fn, agent, task_title, task_description, previo
         if execution.get("status") == "completed":
             execution["attempts"] = attempts
             execution["failure_analysis"] = failure_analysis
+            execution["recovery"] = failure_analysis.get("recovery")
+            execution["retryable"] = failure_analysis.get("retryable")
             return execution
 
         last_execution = execution
@@ -61,6 +63,8 @@ def execute_with_retries(execute_fn, agent, task_title, task_description, previo
         if not should_retry(attempts):
             execution["attempts"] = attempts
             execution["failure_analysis"] = failure_analysis
+            execution["recovery"] = failure_analysis.get("recovery")
+            execution["retryable"] = failure_analysis.get("retryable")
             return execution
 
         previous_context = (
