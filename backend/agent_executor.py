@@ -106,11 +106,23 @@ Previous agent context:
 Required output:
 {config['output']}
 
+Collaboration handoff:
+Structure the response using these sections when applicable:
+1. SUMMARY
+2. KEY FINDINGS
+3. OUTPUTS
+4. ASSUMPTIONS / BLOCKERS
+5. NEXT AGENT CONTEXT
+
+The NEXT AGENT CONTEXT section must contain only information that a downstream
+employee should use when continuing this workflow.
+
 General rules:
 - Stay focused on the assigned task.
 - Be clear, structured, and practical.
 - Do not invent facts, sources, actions, or results.
 - Clearly identify assumptions or missing information.
+- Preserve important details needed by downstream employees.
 - Produce an output that can be passed to the next employee in the workflow.
 """
 
@@ -303,6 +315,23 @@ def _execute_agent_once(
         }
 
 
+
+
+def extract_handoff_context(result: str) -> str:
+    """Extract the downstream handoff section from an agent result."""
+    if not result:
+        return ""
+
+    marker = "NEXT AGENT CONTEXT"
+    if marker not in result:
+        return result.strip()
+
+    handoff = result.split(marker, 1)[1].strip()
+
+    if handoff.startswith(":"):
+        handoff = handoff[1:].strip()
+
+    return handoff
 
 
 def execute_agent(agent: str, task_title: str, task_description: str, previous_context: str = "") -> Dict:

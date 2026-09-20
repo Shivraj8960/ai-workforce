@@ -1,4 +1,4 @@
-from agent_executor import execute_agent, generate_plan
+from agent_executor import execute_agent, generate_plan, extract_handoff_context
 from self_healing import analyze_failure, should_retry, execute_with_retries
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -496,8 +496,20 @@ def execute_task(task_id: str):
         )
     for dependency_id in task.dependencies:
         dependency = get_task_from_db(dependency_id)
+
         if dependency and dependency.result:
-            previous_results.append(f"Previous task {dependency.id} ({dependency.title}):\n{dependency.result}")
+            try:
+                dependency_execution = json.loads(dependency.result)
+                dependency_output = dependency_execution.get("result", dependency.result)
+            except (TypeError, json.JSONDecodeError):
+                dependency_output = dependency.result
+
+            handoff_context = extract_handoff_context(dependency_output)
+
+            previous_results.append(
+                f"Previous task {dependency.id} ({dependency.title}) handoff:\n"
+                f"{handoff_context}"
+            )
 
     task.status = "running"
     save_task(task)
