@@ -45,6 +45,35 @@ def init_db():
         """
     )
 
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS execution_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            agent TEXT,
+            attempt INTEGER NOT NULL,
+            provider TEXT,
+            status TEXT NOT NULL,
+            result TEXT,
+            failure_analysis TEXT,
+            recovery TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent TEXT NOT NULL,
+            task_id TEXT,
+            memory TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
     connection.commit()
     connection.close()
 
@@ -174,6 +203,69 @@ def get_task_from_db(task_id: str):
         return row_to_task(row)
 
     return None
+
+
+def get_agent_memory(agent: str, limit: int = 5):
+    connection = get_db()
+
+    rows = connection.execute(
+        """
+        SELECT task_id, memory, created_at
+        FROM agent_memory
+        WHERE agent = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (agent, limit),
+    ).fetchall()
+
+    connection.close()
+
+    return [dict(row) for row in rows]
+
+
+def save_agent_memory(agent: str, task_id: str, memory: str):
+    if not memory:
+        return
+
+    connection = get_db()
+
+    connection.execute(
+        """
+        INSERT INTO agent_memory
+        (agent, task_id, memory)
+        VALUES (?, ?, ?)
+        """,
+        (agent, task_id, memory),
+    )
+
+    connection.commit()
+    connection.close()
+
+
+def save_execution_history(task_id: str, execution: dict):
+    connection = get_db()
+
+    connection.execute(
+        """
+        INSERT INTO execution_history
+        (task_id, agent, attempt, provider, status, result, failure_analysis, recovery)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            execution.get("agent"),
+            execution.get("attempts", 1),
+            execution.get("provider"),
+            execution.get("status", "unknown"),
+            execution.get("result"),
+            json.dumps(execution.get("failure_analysis")) if execution.get("failure_analysis") else None,
+            execution.get("recovery"),
+        ),
+    )
+
+    connection.commit()
+    connection.close()
 
 
 # =========================
@@ -308,6 +400,43 @@ def get_task(task_id: str):
     }
 
 
+@app.get("/tasks/{task_id}/history")
+def get_task_history(task_id: str):
+    connection = get_db()
+
+    rows = connection.execute(
+        """
+        SELECT id, task_id, agent, attempt, provider, status,
+               result, failure_analysis, recovery, created_at
+        FROM execution_history
+        WHERE task_id = ?
+        ORDER BY id DESC
+        """,
+        (task_id,),
+    ).fetchall()
+
+    connection.close()
+
+    return {
+        "task_id": task_id,
+        "total_executions": len(rows),
+        "history": [dict(row) for row in rows],
+    }
+
+
+
+@app.get("/agents/{agent}/memory")
+def get_agent_memory_endpoint(agent: str):
+    memories = get_agent_memory(agent)
+
+    return {
+        "agent": agent,
+        "total_memories": len(memories),
+        "memories": memories,
+    }
+
+
+
 @app.post("/tasks/{task_id}/execute")
 def execute_task(task_id: str):
 
@@ -333,6 +462,16 @@ def execute_task(task_id: str):
 
     # Gather completed dependency results for agent-to-agent context.
     previous_results = []
+
+    # Retrieve recent memory for the assigned agent.
+    agent_memories = get_agent_memory(task.assigned_to)
+
+    memory_context = ""
+    if agent_memories:
+        memory_context = "\n\nRelevant previous agent memory:\n" + "\n\n".join(
+            f"Memory from task {item['task_id']} ({item['created_at']}):\n{item['memory']}"
+            for item in agent_memories
+        )
     for dependency_id in task.dependencies:
         dependency = get_task_from_db(dependency_id)
         if dependency and dependency.result:
@@ -342,14 +481,19 @@ def execute_task(task_id: str):
     save_task(task)
 
     # Phase 3 agent execution.
-    execution = execute_with_retries(execute_agent,
+    execution = execute_agent(
         task.assigned_to,
         task.title,
-        task.description + ("\n\nContext from completed previous tasks:\n" + "\n\n".join(previous_results) if previous_results else ""),
+        task.description
+        + ("\n\nContext from completed previous tasks:\n" + "\n\n".join(previous_results) if previous_results else "")
+        + memory_context,
     )
 
     task.result = json.dumps(execution)
     task.provider = execution.get("provider")
+    save_execution_history(task.id, execution)
+    if execution.get("status") == "completed":
+        save_agent_memory(execution.get("agent", task.assigned_to), task.id, execution.get("result", ""))
 
     if execution["status"] == "completed":
         task.status = "completed"
