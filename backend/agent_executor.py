@@ -3,6 +3,7 @@ from typing import Dict
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from self_healing import execute_with_retries
 
 
 # Always load the .env file located beside this Python file.
@@ -225,7 +226,7 @@ def execute_with_gemini(prompt):
     return content
 
 
-def execute_agent(
+def _execute_agent_once(
     agent: str,
     task_title: str,
     task_description: str,
@@ -301,3 +302,14 @@ def execute_agent(
             ),
         }
 
+
+
+
+def execute_agent(agent: str, task_title: str, task_description: str, previous_context: str = "") -> Dict:
+    return execute_with_retries(
+        _execute_agent_once,
+        agent,
+        task_title,
+        task_description,
+        previous_context,
+    )

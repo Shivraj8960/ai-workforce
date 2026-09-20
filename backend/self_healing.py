@@ -65,18 +65,19 @@ def execute_with_retries(execute_fn, agent, task_title, task_description, previo
         if execution.get("status") == "completed":
             execution["attempts"] = attempts
             execution["failure_analysis"] = failure_analysis
-            execution["recovery"] = failure_analysis.get("recovery")
-            execution["retryable"] = failure_analysis.get("retryable")
+            execution["recovery"] = failure_analysis.get("recovery") if failure_analysis else None
+            execution["retryable"] = failure_analysis.get("retryable") if failure_analysis else False
             return execution
 
         last_execution = execution
         failure_analysis = analyze_failure(execution)
+        recovery_action = choose_recovery_action(failure_analysis)
 
-        if not should_retry(attempts):
+        if recovery_action == "stop" or not should_retry(attempts):
             execution["attempts"] = attempts
             execution["failure_analysis"] = failure_analysis
-            execution["recovery"] = failure_analysis.get("recovery")
-            execution["retryable"] = failure_analysis.get("retryable")
+            execution["recovery"] = failure_analysis.get("recovery") if failure_analysis else None
+            execution["retryable"] = failure_analysis.get("retryable") if failure_analysis else False
             return execution
 
         previous_context = (
@@ -85,3 +86,17 @@ def execute_with_retries(execute_fn, agent, task_title, task_description, previo
             + f"Previous attempt failed with {failure_analysis['failure_type']}."
             + " Retry the task carefully and produce a complete result."
         )
+
+def choose_recovery_action(failure_analysis: Dict) -> str:
+    if not failure_analysis:
+        return "stop"
+
+    recovery = failure_analysis.get("recovery")
+
+    if recovery in {"retry", "fallback_provider", "stop"}:
+        return recovery
+
+    if failure_analysis.get("retryable") is True:
+        return "retry"
+
+    return "stop"
