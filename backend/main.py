@@ -106,7 +106,6 @@ class Task(BaseModel):
     result: Optional[str] = None
     approval_status: str = "not_required"
     provider: Optional[str] = None
-    approval_status: str = "not_required"
 
 
 # =========================
@@ -336,6 +335,25 @@ def create_plan(request: PlanRequest):
     if not isinstance(planned_tasks, list) or not 3 <= len(planned_tasks) <= 7:
         return {"goal": request.goal, "status": "planning_failed", "error": "AI planner must return between 3 and 7 tasks"}
 
+    connection = get_db()
+    existing_task_ids = connection.execute(
+        "SELECT id FROM tasks WHERE id LIKE 'TASK-%'"
+    ).fetchall()
+    connection.close()
+
+    existing_numbers = []
+    for row in existing_task_ids:
+        try:
+            existing_numbers.append(int(row["id"].split("-")[1]))
+        except (IndexError, ValueError):
+            continue
+
+    next_task_number = max(existing_numbers, default=0) + 1
+    task_id_map = {
+        index: f"TASK-{next_task_number + index - 1:03d}"
+        for index in range(1, len(planned_tasks) + 1)
+    }
+
     created_tasks = []
 
     for index, item in enumerate(planned_tasks, start=1):
@@ -343,10 +361,14 @@ def create_plan(request: PlanRequest):
         if not all(key in item for key in required):
             return {"goal": request.goal, "status": "planning_failed", "error": "AI planner returned an invalid task format"}
 
-        dependencies = [f"TASK-{int(dep):03d}" for dep in item["dependencies"]]
+        try:
+            dependency_numbers = [int(dep) for dep in item["dependencies"]]
+            dependencies = [task_id_map[dep] for dep in dependency_numbers]
+        except (TypeError, ValueError, KeyError):
+            return {"goal": request.goal, "status": "planning_failed", "error": "AI planner returned invalid dependency references"}
 
         task = Task(
-            id=f"TASK-{index:03d}",
+            id=task_id_map[index],
             title=item["title"],
             description=item["description"],
             assigned_to=item["assigned_to"],
