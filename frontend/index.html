@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nex AI — Control Center</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: Inter, Arial, sans-serif;
+            background: #080b12;
+            color: #f4f7fb;
+            min-height: 100vh;
+        }
+
+        .app {
+            display: flex;
+            min-height: 100vh;
+        }
+
+        .sidebar {
+            width: 250px;
+            background: #0d111a;
+            border-right: 1px solid #1d2430;
+            padding: 24px 16px;
+            position: fixed;
+            inset: 0 auto 0 0;
+        }
+
+        .logo {
+            font-size: 24px;
+            font-weight: 800;
+            letter-spacing: -1px;
+            padding: 0 12px 30px;
+        }
+
+        .logo span {
+            color: #6c8cff;
+        }
+
+        .nav-title {
+            font-size: 11px;
+            color: #687386;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            padding: 0 12px 10px;
+        }
+
+        .nav {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        .nav-item {
+            padding: 12px;
+            border-radius: 9px;
+            color: #9aa5b5;
+            cursor: pointer;
+        }
+
+        .nav-item:hover,
+        .nav-item.active {
+            background: #171e2b;
+            color: #ffffff;
+        }
+
+        .main {
+            margin-left: 250px;
+            width: calc(100% - 250px);
+            padding: 30px;
+        }
+
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+        }
+
+        .topbar h1 {
+            font-size: 28px;
+            margin-bottom: 6px;
+        }
+
+        .subtitle {
+            color: #7d8899;
+            font-size: 14px;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: #111822;
+            border: 1px solid #202a38;
+            padding: 9px 14px;
+            border-radius: 20px;
+            font-size: 13px;
+            color: #aab5c5;
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            background: #35d07f;
+            border-radius: 50%;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+            margin-bottom: 25px;
+        }
+
+        .card {
+            background: #0e141e;
+            border: 1px solid #1d2633;
+            border-radius: 14px;
+            padding: 20px;
+        }
+
+        .stat-label {
+            color: #7d8899;
+            font-size: 13px;
+            margin-bottom: 12px;
+        }
+
+        .stat-value {
+            font-size: 28px;
+            font-weight: 750;
+        }
+
+        .content-grid {
+            display: grid;
+            grid-template-columns: 1.6fr 1fr;
+            gap: 18px;
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 18px;
+        }
+
+        .card-header h2 {
+            font-size: 17px;
+        }
+
+        .view {
+            color: #708cff;
+            font-size: 12px;
+        }
+
+        .task {
+            padding: 14px 0;
+            border-bottom: 1px solid #1b2330;
+        }
+
+        .task:last-child {
+            border-bottom: 0;
+        }
+
+        .task-top {
+            display: flex;
+            justify-content: space-between;
+            gap: 15px;
+            margin-bottom: 7px;
+        }
+
+        .task-name {
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        .task-meta {
+            color: #707c8e;
+            font-size: 12px;
+        }
+
+        .badge {
+            font-size: 11px;
+            padding: 4px 8px;
+            border-radius: 12px;
+            background: #15251e;
+            color: #58d995;
+            white-space: nowrap;
+        }
+
+        .agents {
+            display: grid;
+            gap: 10px;
+        }
+
+        .agent {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px;
+            background: #111822;
+            border-radius: 10px;
+        }
+
+        .agent-icon {
+            width: 36px;
+            height: 36px;
+            display: grid;
+            place-items: center;
+            border-radius: 9px;
+            background: #192236;
+            color: #91a5ff;
+            font-weight: 700;
+        }
+
+        .agent-name {
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .agent-status {
+            color: #6f7b8c;
+            font-size: 11px;
+            margin-top: 3px;
+        }
+
+        .quick-action {
+            margin-top: 18px;
+            padding: 20px;
+        }
+
+        .quick-action h2 {
+            font-size: 17px;
+            margin-bottom: 8px;
+        }
+
+        .quick-action p {
+            color: #7d8899;
+            font-size: 13px;
+            margin-bottom: 16px;
+        }
+
+        button {
+            border: 0;
+            border-radius: 9px;
+            padding: 11px 17px;
+            background: #617cff;
+            color: white;
+            font-weight: 650;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #718bff;
+        }
+
+        @media (max-width: 900px) {
+            .sidebar {
+                width: 210px;
+            }
+
+            .main {
+                margin-left: 210px;
+                width: calc(100% - 210px);
+            }
+
+            .stats {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .content-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 650px) {
+            .sidebar {
+                display: none;
+            }
+
+            .main {
+                margin-left: 0;
+                width: 100%;
+                padding: 18px;
+            }
+
+            .stats {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="app">
+
+        <aside class="sidebar">
+            <div class="logo">Nex<span>AI</span></div>
+
+            <div class="nav-title">Workspace</div>
+
+            <nav class="nav">
+                <div class="nav-item active">Dashboard</div>
+                <div class="nav-item">Workforce</div>
+                <div class="nav-item">Tasks</div>
+                <div class="nav-item">Agents</div>
+                <div class="nav-item">Memory</div>
+                <div class="nav-item">Execution</div>
+            </nav>
+        </aside>
+
+        <main class="main">
+
+            <header class="topbar">
+                <div>
+                    <h1>Control Center</h1>
+                    <div class="subtitle">
+                        Monitor and orchestrate your AI workforce.
+                    </div>
+                </div>
+
+                <div class="status">
+                    <span class="dot"></span>
+                    Nex AI Online
+                </div>
+            </header>
+
+            <section class="stats">
+                <div class="card">
+                    <div class="stat-label">AI Employees</div>
+                    <div class="stat-value">5</div>
+                </div>
+
+                <div class="card">
+                    <div class="stat-label">Total Tasks</div>
+                    <div class="stat-value">14</div>
+                </div>
+
+                <div class="card">
+                    <div class="stat-label">Completed</div>
+                    <div class="stat-value">14</div>
+                </div>
+
+                <div class="card">
+                    <div class="stat-label">Failed</div>
+                    <div class="stat-value">0</div>
+                </div>
+            </section>
+
+            <section class="content-grid">
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Recent Tasks</h2>
+                        <span class="view">View all</span>
+                    </div>
+
+                    <div class="task">
+                        <div class="task-top">
+                            <span class="task-name">Finalize report</span>
+                            <span class="badge">Completed</span>
+                        </div>
+                        <div class="task-meta">
+                            TASK-018 · Executor · 1 attempt
+                        </div>
+                    </div>
+
+                    <div class="task">
+                        <div class="task-top">
+                            <span class="task-name">Review analysis</span>
+                            <span class="badge">Completed</span>
+                        </div>
+                        <div class="task-meta">
+                            TASK-017 · Reviewer · 1 attempt
+                        </div>
+                    </div>
+
+                    <div class="task">
+                        <div class="task-top">
+                            <span class="task-name">Draft analysis</span>
+                            <span class="badge">Completed</span>
+                        </div>
+                        <div class="task-meta">
+                            TASK-016 · Writer · 1 attempt
+                        </div>
+                    </div>
+
+                    <div class="task">
+                        <div class="task-top">
+                            <span class="task-name">Summarize findings</span>
+                            <span class="badge">Completed</span>
+                        </div>
+                        <div class="task-meta">
+                            TASK-015 · Analyst · 1 attempt
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>AI Employees</h2>
+                    </div>
+
+                    <div class="agents">
+                        <div class="agent">
+                            <div class="agent-icon">R</div>
+                            <div>
+                                <div class="agent-name">Researcher</div>
+                                <div class="agent-status">Ready</div>
+                            </div>
+                        </div>
+
+                        <div class="agent">
+                            <div class="agent-icon">A</div>
+                            <div>
+                                <div class="agent-name">Analyst</div>
+                                <div class="agent-status">Ready</div>
+                            </div>
+                        </div>
+
+                        <div class="agent">
+                            <div class="agent-icon">W</div>
+                            <div>
+                                <div class="agent-name">Writer</div>
+                                <div class="agent-status">Ready</div>
+                            </div>
+                        </div>
+
+                        <div class="agent">
+                            <div class="agent-icon">D</div>
+                            <div>
+                                <div class="agent-name">Designer</div>
+                                <div class="agent-status">Ready</div>
+                            </div>
+                        </div>
+
+                        <div class="agent">
+                            <div class="agent-icon">E</div>
+                            <div>
+                                <div class="agent-name">Executor</div>
+                                <div class="agent-status">Ready</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            </section>
+
+            <section class="card quick-action">
+                <h2>Start a new workforce</h2>
+                <p>
+                    Give Nex AI a goal and let the planner create a task workflow.
+                </p>
+                <button id="createGoalBtn">Create Workforce Goal</button>
+            </section>
+
+        </main>
+    </div>
+<script src="app.js?v=2"></script>
+</body>
+</html>
