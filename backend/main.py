@@ -1,6 +1,7 @@
 from agent_executor import execute_agent, generate_plan, extract_handoff_context
 from self_healing import analyze_failure, should_retry, execute_with_retries
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List
 import sqlite3
@@ -12,6 +13,15 @@ app = FastAPI(
     version="0.3.0",
     description="Nex AI task planning and execution API"
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1:5501", "http://localhost:5501"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 
 # =========================

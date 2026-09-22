@@ -107,15 +107,31 @@ Required output:
 {config['output']}
 
 Collaboration handoff:
-Structure the response using these sections when applicable:
+You MUST end every response with this exact section heading:
+
+NEXT AGENT CONTEXT
+
+Under that heading, provide concise, actionable information that the downstream
+employee needs to continue the workflow.
+
+IMPORTANT:
+- Derive this section from the actual work you completed.
+- Include the most important findings, outputs, decisions, assumptions, blockers,
+  and next steps that a downstream employee should know.
+- NEVER write "None" if the response contains useful information that can be
+  passed to the next employee.
+- Only write "None" when there is genuinely no useful information to transfer.
+
+Use these sections before the mandatory handoff when applicable:
 1. SUMMARY
 2. KEY FINDINGS
 3. OUTPUTS
 4. ASSUMPTIONS / BLOCKERS
-5. NEXT AGENT CONTEXT
 
-The NEXT AGENT CONTEXT section must contain only information that a downstream
-employee should use when continuing this workflow.
+IMPORTANT:
+- The exact text "NEXT AGENT CONTEXT" MUST appear in every response.
+- Do not omit this section.
+- Do not put the handoff information in another section.
 
 General rules:
 - Stay focused on the assigned task.
@@ -135,6 +151,7 @@ def execute_with_mercury(prompt):
 
     client = OpenAI(
         api_key=api_key,
+        timeout=20.0,
         base_url="https://api.inceptionlabs.ai/v1",
     )
 
@@ -216,6 +233,7 @@ def execute_with_gemini(prompt):
 
     client = OpenAI(
         api_key=api_key,
+        timeout=20.0,
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
     )
 
