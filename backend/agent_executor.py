@@ -209,7 +209,7 @@ User goal:
 Create a practical workflow of 3 to 7 tasks. Return ONLY valid JSON as a list. Each task must contain exactly these fields:
 - title: short task name
 - description: clear task description
-- assigned_to: one of Researcher, Analyst, Writer, Reviewer, Executor
+- assigned_to: one of Researcher, Analyst, Writer, Designer, Reviewer, Executor
 - dependencies: list of previous task numbers, using integers starting from 1
 
 Example format:
