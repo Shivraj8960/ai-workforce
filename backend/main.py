@@ -139,6 +139,11 @@ employees_db = [
         goal="Create clear and personalized content"
     ),
     Employee(
+        name="Designer",
+        role="Design AI",
+        goal="Create layouts, UX concepts, and design specifications"
+    ),
+    Employee(
         name="Executor",
         role="Execution AI",
         goal="Execute approved actions"
