@@ -114,6 +114,57 @@ function escapeHtml(value) {
         .replaceAll("'", "&#039;");
 }
 
+function formatExecutionResult(value) {
+    const text = String(value || "");
+
+    if (!text.trim()) {
+        return '<div class="task-meta">No execution result recorded.</div>';
+    }
+
+    return text
+        .split("\n")
+        .map(line => {
+            const escaped = escapeHtml(line.trim());
+
+            if (!escaped) {
+                return '<div style="height:8px;"></div>';
+            }
+
+            if (/^\*\*.+\*\*$/.test(escaped)) {
+                return `<h3 style="margin:14px 0 8px;">${escaped.replace(/\*\*/g, "")}</h3>`;
+            }
+
+            if (/^[-*]\s+/.test(escaped)) {
+                const content = escaped.replace(/^[-*]\s+/, "");
+                return `<div style="margin:5px 0 5px 16px;">• ${content.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")}</div>`;
+            }
+
+            if (/^\d+\.\s+/.test(escaped)) {
+                const content = escaped.replace(/^\d+\.\s+/, "");
+                return `<div style="margin:5px 0 5px 16px;">${escaped.match(/^\d+/)[0]}. ${content.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")}</div>`;
+            }
+
+            if (escaped.includes("|") && escaped.split("|").length >= 3) {
+                const cells = escaped.split("|").slice(1, -1).map(cell => cell.trim());
+
+                if (cells.length && cells.every(cell => /^[-:]+$/.test(cell))) {
+                    return "";
+                }
+
+                const formattedCells = cells
+                    .map(cell => cell.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>"))
+                    .map(cell => `<div style="flex:1;padding:7px 10px;border-bottom:1px solid rgba(255,255,255,0.08);">${cell}</div>`)
+                    .join("");
+
+                return `<div style="display:flex;gap:0;margin:2px 0;">${formattedCells}</div>`;
+            }
+
+            const formatted = escaped.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+            return `<div style="margin:6px 0;white-space:pre-wrap;">${formatted}</div>`;
+        })
+        .join("");
+}
+
 async function createWorkforceGoal() {
     const goal = prompt("Enter your workforce goal:");
 
@@ -594,12 +645,37 @@ async function renderAgents() {
             </div>
         </header>
 
+        <section class="stats" id="agentOverviewStats">
+            <div class="card">
+                <div class="stat-label">AI Employees</div>
+                <div class="stat-value" id="agentTotalCount">—</div>
+            </div>
+            <div class="card">
+                <div class="stat-label">Assigned Tasks</div>
+                <div class="stat-value" id="agentTaskCount">—</div>
+            </div>
+            <div class="card">
+                <div class="stat-label">Completed</div>
+                <div class="stat-value" id="agentCompletedCount">—</div>
+            </div>
+            <div class="card">
+                <div class="stat-label">Failed</div>
+                <div class="stat-value" id="agentFailedCount">—</div>
+            </div>
+        </section>
+
         <section class="card">
-            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;">
+            <div class="card-header">
+                <h2>Workforce Agents</h2>
+                <span class="view">Live backend data</span>
+            </div>
+
+            <div id="agentCards"
+                 style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;">
                 ${agents.map(agent => `
                     <div class="task agent-card"
                          data-agent="${agent.key}"
-                         style="cursor:pointer;min-height:150px;">
+                         style="cursor:pointer;min-height:190px;padding:18px;border:1px solid #1d2633;border-radius:12px;background:#101722;">
                         <div style="display:flex;align-items:center;gap:12px;">
                             <div style="width:42px;height:42px;border-radius:10px;background:#18233a;display:flex;align-items:center;justify-content:center;color:#8da2ff;font-weight:700;font-size:18px;">
                                 ${agent.name.charAt(0)}
@@ -610,16 +686,80 @@ async function renderAgents() {
                             </div>
                         </div>
 
-                        <p style="color:#8d98aa;line-height:1.5;margin-top:16px;">
+                        <p style="color:#8d98aa;line-height:1.5;margin:16px 0 12px;">
                             ${agent.description}
                         </p>
 
-                        <div class="badge">View Memory →</div>
+                        <div class="agent-live-stats"
+                             data-agent-stats="${agent.key}"
+                             style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;">
+                            <div style="background:#0b111a;border-radius:8px;padding:8px;">
+                                <div class="task-meta">Tasks</div>
+                                <div style="font-weight:700;margin-top:3px;">—</div>
+                            </div>
+                            <div style="background:#0b111a;border-radius:8px;padding:8px;">
+                                <div class="task-meta">Done</div>
+                                <div style="font-weight:700;margin-top:3px;">—</div>
+                            </div>
+                            <div style="background:#0b111a;border-radius:8px;padding:8px;">
+                                <div class="task-meta">Failed</div>
+                                <div style="font-weight:700;margin-top:3px;">—</div>
+                            </div>
+                        </div>
+
+                        <div class="badge">Open Agent Dashboard →</div>
                     </div>
                 `).join("")}
             </div>
         </section>
     `;
+
+    try {
+        const data = await api("/tasks");
+        const tasks = data.tasks || [];
+
+        const agentStats = agents.map(agent => {
+            const assigned = tasks.filter(
+                task => String(task.assigned_to || "").toLowerCase() === agent.key
+            );
+
+            return {
+                ...agent,
+                total: assigned.length,
+                completed: assigned.filter(task => task.status === "completed").length,
+                failed: assigned.filter(task => task.status === "failed").length
+            };
+        });
+
+        const totalTasks = agentStats.reduce((sum, agent) => sum + agent.total, 0);
+        const totalCompleted = agentStats.reduce((sum, agent) => sum + agent.completed, 0);
+        const totalFailed = agentStats.reduce((sum, agent) => sum + agent.failed, 0);
+
+        setText("agentTotalCount", agents.length);
+        setText("agentTaskCount", totalTasks);
+        setText("agentCompletedCount", totalCompleted);
+        setText("agentFailedCount", totalFailed);
+
+        agentStats.forEach(agent => {
+            const card = document.querySelector(
+                `[data-agent-stats="${agent.key}"]`
+            );
+
+            if (!card) return;
+
+            const values = card.querySelectorAll(
+                "div > div:last-child"
+            );
+
+            if (values.length >= 3) {
+                values[0].textContent = agent.total;
+                values[1].textContent = agent.completed;
+                values[2].textContent = agent.failed;
+            }
+        });
+    } catch (error) {
+        console.error("Unable to load agent statistics:", error);
+    }
 
     main.querySelectorAll("[data-agent]").forEach(card => {
         card.addEventListener("click", () => {
@@ -636,7 +776,7 @@ async function showAgentMemory(agentKey, agents) {
         <header class="topbar">
             <div>
                 <h1>${escapeHtml(agent?.name || agentKey)}</h1>
-                <div class="subtitle">${escapeHtml(agent?.description || "Nex AI agent memory")}</div>
+                <div class="subtitle">${escapeHtml(agent?.description || "Nex AI agent dashboard")}</div>
             </div>
             <div class="status">
                 <span class="dot online"></span>
@@ -650,10 +790,55 @@ async function showAgentMemory(agentKey, agents) {
                 ← Back to Agents
             </button>
 
-            <h2>Agent Memory</h2>
-            <div id="agentMemory" style="margin-top:18px;color:#aab4c4;">
-                Loading memory...
+            <div style="display:flex;align-items:center;gap:14px;margin-bottom:20px;">
+                <div style="width:52px;height:52px;border-radius:12px;background:#18233a;display:flex;align-items:center;justify-content:center;color:#8da2ff;font-weight:700;font-size:22px;">
+                    ${escapeHtml((agent?.name || agentKey).charAt(0))}
+                </div>
+                <div>
+                    <div style="font-size:22px;font-weight:700;">${escapeHtml(agent?.name || agentKey)}</div>
+                    <div class="task-meta">
+    ${escapeHtml(agentKey)} · <span id="agentStatus">Checking...</span>
+</div>
+                </div>
             </div>
+
+            <div id="agentDashboardStats"
+                 style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:22px;">
+                <div class="card"><div class="stat-label">Assigned Tasks</div><div class="stat-value">—</div></div>
+                <div class="card"><div class="stat-label">Completed</div><div class="stat-value">—</div></div>
+                <div class="card"><div class="stat-label">Failed</div><div class="stat-value">—</div></div>
+                <div class="card"><div class="stat-label">Success Rate</div><div class="stat-value">—</div></div>
+            </div>
+
+            <section style="margin-bottom:24px;">
+                <div class="card-header">
+                    <h2>Current Tasks</h2>
+                    <span class="view" id="currentTaskCount">Loading...</span>
+                </div>
+                <div id="agentCurrentTasks" style="margin-top:14px;">
+                    Loading tasks...
+                </div>
+            </section>
+
+            <section style="margin-bottom:24px;">
+                <div class="card-header">
+                    <h2>Recent Executions</h2>
+                    <span class="view" id="executionCount">Loading...</span>
+                </div>
+                <div id="agentExecutions" style="margin-top:14px;">
+                    Loading executions...
+                </div>
+            </section>
+
+            <section>
+                <div class="card-header">
+                    <h2>Agent Memory</h2>
+                    <span class="view" id="memoryCount">Loading...</span>
+                </div>
+                <div id="agentMemory" style="margin-top:14px;">
+                    Loading memory...
+                </div>
+            </section>
         </section>
     `;
 
@@ -662,403 +847,429 @@ async function showAgentMemory(agentKey, agents) {
     });
 
     try {
-        const data = await api(`/agents/${encodeURIComponent(agentKey)}/memory`);
-        const memories = data.memory || data.memories || [];
+        const [tasksData, historyData, memoryData] = await Promise.all([
+            api("/tasks"),
+            api(`/agents/${encodeURIComponent(agentKey)}/history`),
+            api(`/agents/${encodeURIComponent(agentKey)}/memory`)
+        ]);
 
-        const container = document.getElementById("agentMemory");
+        const tasks = tasksData.tasks || [];
+        const history = historyData.history || [];
+        const memories = memoryData.memory || memoryData.memories || [];
 
-        if (!memories.length) {
-            container.innerHTML = "No memory recorded for this agent yet.";
-            return;
+        const assignedTasks = tasks.filter(
+            task => String(task.assigned_to || "").toLowerCase() === agentKey.toLowerCase()
+        );
+
+        const running = assignedTasks.some(
+            task => task.status === "running"
+        );
+
+        const statusElement = document.getElementById("agentStatus");
+        if (statusElement) {
+            statusElement.textContent = running ? "Working" : "Idle";
         }
 
-        container.innerHTML = memories.map(memory => `
-            <div class="task" style="margin-bottom:10px;">
-                <div class="task-top">
-                    <span class="task-name">
-                        ${escapeHtml(memory.task_id || "Agent Memory")}
-                    </span>
+        const completed = assignedTasks.filter(
+            task => task.status === "completed"
+        ).length;
+
+        const failed = assignedTasks.filter(
+            task => task.status === "failed"
+        ).length;
+
+        const successRate = assignedTasks.length
+            ? Math.round((completed / assignedTasks.length) * 100)
+            : 0;
+
+        const stats = document.querySelectorAll("#agentDashboardStats .stat-value");
+
+        if (stats.length >= 4) {
+            stats[0].textContent = assignedTasks.length;
+            stats[1].textContent = completed;
+            stats[2].textContent = failed;
+            stats[3].textContent = `${successRate}%`;
+        }
+
+        const currentTaskCount = document.getElementById("currentTaskCount");
+        const currentTaskContainer = document.getElementById("agentCurrentTasks");
+
+        if (currentTaskCount) {
+            currentTaskCount.textContent =
+                `${assignedTasks.length} task${assignedTasks.length === 1 ? "" : "s"}`;
+        }
+
+        if (currentTaskContainer) {
+            if (!assignedTasks.length) {
+                currentTaskContainer.innerHTML =
+                    '<div class="task-meta">No tasks assigned to this agent.</div>';
+            } else {
+                currentTaskContainer.innerHTML = assignedTasks.map(task => `
+                    <div class="task" data-current-task="${escapeHtml(task.id || "")}" style="margin-bottom:10px;cursor:pointer;">
+                        <div class="task-top">
+                            <span class="task-name">
+                                ${escapeHtml(task.id || "Unknown task")}
+                            </span>
+                            <span class="badge">
+                                ${escapeHtml(task.status || "unknown")}
+                            </span>
+                        </div>
+
+                        <div class="task-meta" style="margin-top:8px;">
+                            ${escapeHtml(task.title || task.description || "No task description")}
+                        </div>
+
+                        <div class="task-meta" style="margin-top:6px;">
+                            Priority: ${escapeHtml(task.priority || "—")}
+                        </div>
+                    </div>
+                `).join("");
+            }
+        }
+
+        document.querySelectorAll("[data-current-task]").forEach(element => {
+            element.addEventListener("click", async () => {
+                const taskId = element.dataset.currentTask;
+                if (!taskId) return;
+
+                try {
+                    const task = await api(`/tasks/${encodeURIComponent(taskId)}`);
+
+                    main.innerHTML = `
+                        <header class="topbar">
+                            <div>
+                                <h1>Task Details</h1>
+                                <div class="subtitle">Nex AI task information</div>
+                            </div>
+                            <div class="status">
+                                <span class="dot online"></span>
+                                Nex AI Online
+                            </div>
+                        </header>
+
+                        <section class="card">
+                            <button id="backToAgentDashboard"
+                                style="padding:9px 14px;border:0;border-radius:7px;background:#1b2535;color:#fff;cursor:pointer;margin-bottom:18px;">
+                                ← Back to ${escapeHtml(agent?.name || agentKey)}
+                            </button>
+
+                            <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px;">
+                                <div>
+                                    <div style="font-size:24px;font-weight:700;">
+                                        ${escapeHtml(task.id || "Unknown task")}
+                                    </div>
+                                    <div class="task-meta" style="margin-top:5px;">
+                                        ${escapeHtml(task.title || "Untitled task")}
+                                    </div>
+                                </div>
+                                <span class="badge">
+                                    ${escapeHtml(task.status || "unknown")}
+                                </span>
+                            </div>
+
+                            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:22px;">
+                                <div class="card">
+                                    <div class="stat-label">Assigned To</div>
+                                    <div style="font-weight:600;margin-top:6px;">
+                                        ${escapeHtml(task.assigned_to || "Unassigned")}
+                                    </div>
+                                </div>
+
+                                <div class="card">
+                                    <div class="stat-label">Priority</div>
+                                    <div style="font-weight:600;margin-top:6px;">
+                                        ${escapeHtml(task.priority || "—")}
+                                    </div>
+                                </div>
+
+                                <div class="card">
+                                    <div class="stat-label">Approval</div>
+                                    <div style="font-weight:600;margin-top:6px;">
+                                        ${escapeHtml(task.approval_status || "—")}
+                                    </div>
+                                </div>
+
+                                <div class="card">
+                                    <div class="stat-label">Provider</div>
+                                    <div style="font-weight:600;margin-top:6px;">
+                                        ${escapeHtml(task.provider || "—")}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div style="margin-bottom:22px;">
+                                <h2>Description</h2>
+                                <div class="task-meta" style="white-space:pre-wrap;margin-top:10px;">
+                                    ${escapeHtml(task.description || "No description available.")}
+                                </div>
+                            </div>
+
+                            <section style="margin-top:24px;">
+                                <div class="card-header">
+                                    <h2>Execution History</h2>
+                                    <span class="view" id="taskExecutionCount">Loading...</span>
+                                </div>
+                                <div id="taskExecutionHistory" style="margin-top:14px;">
+                                    Loading execution history...
+                                </div>
+                            </section>
+
+                            <div>
+                                <h2>Dependencies</h2>
+                                <div class="task-meta" style="margin-top:10px;">
+                                    ${task.dependencies?.length
+                                        ? task.dependencies.map(dep => escapeHtml(dep)).join(", ")
+                                        : "No dependencies"}
+                                </div>
+                            </div>
+                        </section>
+                    `;
+
+                    const taskHistory = await api(
+                        `/tasks/${encodeURIComponent(taskId)}/history`
+                    );
+
+                    const taskHistoryItems = taskHistory.history || [];
+                    const taskExecutionCount = document.getElementById("taskExecutionCount");
+                    const taskExecutionHistory = document.getElementById("taskExecutionHistory");
+
+                    if (taskExecutionCount) {
+                        taskExecutionCount.textContent =
+                            `${taskHistoryItems.length} execution${taskHistoryItems.length === 1 ? "" : "s"}`;
+                    }
+
+                    if (taskExecutionHistory) {
+                        if (!taskHistoryItems.length) {
+                            taskExecutionHistory.innerHTML =
+                                '<div class="task-meta">No execution history recorded.</div>';
+                        } else {
+                            taskExecutionHistory.innerHTML = taskHistoryItems.map(execution => `
+                                <div class="task" style="margin-bottom:10px;">
+                                    <div class="task-top">
+                                        <span class="task-name">
+                                            Attempt ${escapeHtml(String(execution.attempt ?? "—"))}
+                                        </span>
+                                        <span class="badge">
+                                            ${escapeHtml(execution.status || "unknown")}
+                                        </span>
+                                    </div>
+
+                                    <div class="task-meta" style="margin-top:8px;">
+                                        Agent: ${escapeHtml(execution.agent || "—")}
+                                        · Provider: ${escapeHtml(execution.provider || "—")}
+                                    </div>
+
+                                    <div class="task-meta" style="margin-top:6px;">
+                                        ${escapeHtml(execution.created_at || "—")}
+                                    </div>
+
+                                    ${
+                                        execution.recovery
+                                            ? `<div class="task-meta" style="margin-top:6px;">
+                                                Recovery: ${escapeHtml(execution.recovery)}
+                                              </div>`
+                                            : ""
+                                    }
+                                </div>
+                            `).join("");
+                        }
+                    }
+
+                    document.getElementById("backToAgentDashboard").addEventListener("click", () => {
+        showAgentMemory(agentKey, agents);
+    });
+
+        } catch (error) {
+            alert(`Unable to load task: ${error.message}`);
+        }
+    });
+});
+
+        document.getElementById("executionCount").textContent =
+            `${history.length} execution${history.length === 1 ? "" : "s"}`;
+
+        const executionContainer = document.getElementById("agentExecutions");
+
+        if (!history.length) {
+            executionContainer.innerHTML =
+                '<div class="task-meta">No executions recorded for this agent yet.</div>';
+        } else {
+            executionContainer.innerHTML = history.slice(0, 10).map(execution => `
+                <div class="task" data-execution-task="${escapeHtml(execution.task_id || "")}" data-execution-id="${escapeHtml(String(execution.id ?? ""))}" style="margin-bottom:10px;cursor:pointer;">
+                    <div class="task-top">
+                        <span class="task-name">
+                            ${escapeHtml(execution.task_id || "Unknown task")}
+                        </span>
+                        <span class="badge">
+                            ${escapeHtml(execution.status || "unknown")}
+                        </span>
+                    </div>
+
+                    <div class="task-meta" style="margin-top:8px;">
+                        Attempt: ${escapeHtml(String(execution.attempt ?? "—"))}
+                        · Provider: ${escapeHtml(execution.provider || "—")}
+                        · ${escapeHtml(execution.created_at || "—")}
+                    </div>
+
+                    ${
+                        execution.recovery
+                            ? `<div class="task-meta" style="margin-top:6px;">
+                                Recovery: ${escapeHtml(execution.recovery)}
+                               </div>`
+                            : ""
+                    }
                 </div>
-                <div class="task-meta" style="white-space:pre-wrap;margin-top:10px;">
-                    ${escapeHtml(memory.memory || memory.content || String(memory))}
+            `).join("");
+        }
+
+        document.querySelectorAll("[data-execution-task]").forEach(element => {
+            element.addEventListener("click", async () => {
+                const taskId = element.dataset.executionTask;
+                if (!taskId) return;
+                try {
+                    const historyData = await api(
+                    `/tasks/${encodeURIComponent(taskId)}/history`
+                );
+                const executionId = element.dataset.executionId;
+                const execution = (historyData.history || []).find(
+                    item => String(item.id) === String(executionId)
+                );
+                if (!execution) {
+                    throw new Error("Execution record not found");
+                }
+
+                main.innerHTML = `
+                    <header class="topbar">
+                        <div>
+                            <h1>Execution Details</h1>
+                            <div class="subtitle">Nex AI execution record</div>
+                        </div>
+                        <div class="status">
+                            <span class="dot online"></span>
+                            Nex AI Online
+                        </div>
+                    </header>
+
+                    <section class="card">
+                        <button id="backToAgentDashboard"
+                            style="padding:9px 14px;border:0;border-radius:7px;background:#1b2535;color:#fff;cursor:pointer;margin-bottom:18px;">
+                            ← Back to ${escapeHtml(agent?.name || agentKey)}
+                        </button>
+
+                        <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px;">
+                            <div>
+                                <div style="font-size:24px;font-weight:700;">
+                                    Execution #${escapeHtml(String(execution.id ?? "—"))}
+                                </div>
+                                <div class="task-meta" style="margin-top:5px;">
+                                    Task ${escapeHtml(execution.task_id || "Unknown task")}
+                                </div>
+                            </div>
+                            <span class="badge">
+                                ${escapeHtml(execution.status || "unknown")}
+                            </span>
+                        </div>
+
+                        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:22px;">
+                            <div class="card">
+                                <div class="stat-label">Agent</div>
+                                <div style="font-weight:600;margin-top:6px;">
+                                    ${escapeHtml(execution.agent || "—")}
+                                </div>
+                            </div>
+
+                            <div class="card">
+                                <div class="stat-label">Attempt</div>
+                                <div style="font-weight:600;margin-top:6px;">
+                                    ${escapeHtml(String(execution.attempt ?? "—"))}
+                                </div>
+                            </div>
+
+                            <div class="card">
+                                <div class="stat-label">Provider</div>
+                                <div style="font-weight:600;margin-top:6px;">
+                                    ${escapeHtml(execution.provider || "—")}
+                                </div>
+                            </div>
+
+                            <div class="card">
+                                <div class="stat-label">Created</div>
+                                <div style="font-weight:600;margin-top:6px;">
+                                    ${escapeHtml(execution.created_at || "—")}
+                                </div>
+                            </div>
+                        </div>
+
+                        <div style="margin-bottom:22px;">
+                            <h2>Recovery</h2>
+                            <div class="task-meta" style="white-space:pre-wrap;margin-top:10px;">
+                                ${escapeHtml(execution.recovery || "No recovery action recorded.")}
+                            </div>
+                        </div>
+
+                        <div style="margin-bottom:22px;">
+                            <h2>Failure Analysis</h2>
+                            <div class="task-meta" style="white-space:pre-wrap;margin-top:10px;">
+                                ${escapeHtml(execution.failure_analysis || "No failure analysis recorded.")}
+                            </div>
+                        </div>
+
+                        <div>
+                            <h2>Execution Result</h2>
+                            <div class="task-meta" style="white-space:pre-wrap;margin-top:10px;">
+                                ${formatExecutionResult(execution.result)}
+                            </div>
+                        </div>
+                    </section>
+                `;
+
+                document.getElementById("backToAgentDashboard").addEventListener("click", () => {
+                    showAgentMemory(agentKey, agents);
+                });
+
+            } catch (error) {
+                    alert(`Unable to load execution task: ${error.message}`);
+                }
+            });
+        });
+
+        document.getElementById("memoryCount").textContent =
+            `${memories.length} memor${memories.length === 1 ? "y" : "ies"}`;
+
+        const memoryContainer = document.getElementById("agentMemory");
+
+        if (!memories.length) {
+            memoryContainer.innerHTML =
+                '<div class="task-meta">No memory recorded for this agent yet.</div>';
+        } else {
+            memoryContainer.innerHTML = memories.slice(0, 10).map(memory => `
+                <div class="task" style="margin-bottom:10px;">
+                    <div class="task-top">
+                        <span class="task-name">
+                            ${escapeHtml(memory.task_id || "Agent Memory")}
+                        </span>
+                    </div>
+
+                    <div class="task-meta" style="white-space:pre-wrap;margin-top:10px;">
+                        ${escapeHtml(memory.memory || memory.content || String(memory))}
+                    </div>
+
+                    ${
+                        memory.created_at
+                            ? `<div class="task-meta" style="margin-top:8px;">
+                                Created: ${escapeHtml(memory.created_at)}
+                               </div>`
+                            : ""
+                    }
                 </div>
-            </div>
-        `).join("");
+            `).join("");
+        }
     } catch (error) {
+        document.getElementById("agentExecutions").innerHTML =
+            `<div class="task-meta">Unable to load agent dashboard: ${escapeHtml(error.message)}</div>`;
+
         document.getElementById("agentMemory").innerHTML =
             `<div class="task-meta">Unable to load agent memory: ${escapeHtml(error.message)}</div>`;
     }
 }
 
-
-async function renderTasks() {
-    const main = document.querySelector(".main");
-    if (!main) return;
-
-    main.innerHTML = `
-        <header class="topbar">
-            <div>
-                <h1>Tasks</h1>
-                <div class="subtitle">Monitor, inspect, and manage Nex AI tasks.</div>
-            </div>
-            <div class="status">
-                <span class="dot online"></span>
-                Nex AI Online
-            </div>
-        </header>
-
-        <section class="card">
-            <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px;">
-                <input id="taskSearch"
-                       placeholder="Search tasks..."
-                       style="flex:1;min-width:220px;padding:12px;border-radius:8px;border:1px solid #263044;background:#111722;color:#fff;">
-                <select id="taskStatusFilter"
-                        style="padding:12px;border-radius:8px;border:1px solid #263044;background:#111722;color:#fff;">
-                    <option value="all">All Status</option>
-                    <option value="pending">Pending</option>
-                    <option value="running">Running</option>
-                    <option value="completed">Completed</option>
-                    <option value="failed">Failed</option>
-                    <option value="blocked">Blocked</option>
-                </select>
-            </div>
-
-            <div id="taskStats" style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px;"></div>
-            <div id="tasksWorkspace">Loading tasks...</div>
-        </section>
-    `;
-
-    let allTasks = [];
-
-    async function refreshTasks() {
-        const container = document.getElementById("tasksWorkspace");
-
-        try {
-            const data = await api("/tasks");
-            allTasks = data.tasks || [];
-            renderTaskList();
-        } catch (error) {
-            container.innerHTML =
-                `<div class="task-meta">Unable to load tasks: ${escapeHtml(error.message)}</div>`;
-        }
-    }
-
-    function renderTaskList() {
-        const container = document.getElementById("tasksWorkspace");
-        const search = (document.getElementById("taskSearch")?.value || "").toLowerCase();
-        const status = document.getElementById("taskStatusFilter")?.value || "all";
-
-        const filtered = allTasks.filter(task => {
-            const matchesSearch =
-                !search ||
-                String(task.id || "").toLowerCase().includes(search) ||
-                String(task.title || "").toLowerCase().includes(search) ||
-                String(task.assigned_to || "").toLowerCase().includes(search);
-
-            const matchesStatus =
-                status === "all" || task.status === status;
-
-            return matchesSearch && matchesStatus;
-        });
-
-        const completed = allTasks.filter(t => t.status === "completed").length;
-        const pending = allTasks.filter(t => t.status === "pending").length;
-        const failed = allTasks.filter(t => t.status === "failed").length;
-
-        document.getElementById("taskStats").innerHTML = `
-            <div class="badge">Total: ${allTasks.length}</div>
-            <div class="badge">Completed: ${completed}</div>
-            <div class="badge">Pending: ${pending}</div>
-            <div class="badge">Failed: ${failed}</div>
-        `;
-
-        if (!filtered.length) {
-            container.innerHTML =
-                `<div class="task-meta">No tasks match your filters.</div>`;
-            return;
-        }
-
-        container.innerHTML = filtered.map(task => {
-            const dependencies = Array.isArray(task.dependencies)
-                ? task.dependencies.join(", ") || "None"
-                : String(task.dependencies || "None");
-
-            return `
-                <div class="task"
-                     data-task-id="${escapeHtml(task.id)}"
-                     style="cursor:pointer;margin-bottom:10px;">
-                    <div class="task-top">
-                        <span class="task-name">${escapeHtml(task.title || "Untitled task")}</span>
-                        <span class="badge">${escapeHtml(task.status || "unknown")}</span>
-                    </div>
-
-                    <div class="task-meta">
-                        ${escapeHtml(task.id || "")}
-                        · ${escapeHtml(task.assigned_to || "Unassigned")}
-                        · Priority: ${escapeHtml(task.priority || "medium")}
-                        · Dependencies: ${escapeHtml(dependencies)}
-                    </div>
-                </div>
-            `;
-        }).join("");
-
-        container.querySelectorAll("[data-task-id]").forEach(element => {
-            element.addEventListener("click", () => {
-                const task = allTasks.find(t => t.id === element.dataset.taskId);
-                if (task) showTaskDetails(task);
-            });
-        });
-    }
-
-    async function showTaskDetails(task) {
-        const container = document.getElementById("tasksWorkspace");
-
-        container.innerHTML = `
-            <div style="margin-bottom:18px;">
-                <button id="backToTasks"
-                        style="padding:9px 14px;border:0;border-radius:7px;background:#1b2535;color:#fff;cursor:pointer;">
-                    ← Back to Tasks
-                </button>
-            </div>
-
-            <div class="card">
-                <h2>${escapeHtml(task.title || "Untitled task")}</h2>
-
-                <div class="task-meta" style="margin-top:10px;">
-                    ID: ${escapeHtml(task.id || "")}
-                </div>
-
-                <div class="task-meta">
-                    Agent: ${escapeHtml(task.assigned_to || "Unassigned")}
-                    · Status: ${escapeHtml(task.status || "unknown")}
-                    · Priority: ${escapeHtml(task.priority || "medium")}
-                </div>
-
-                <div style="margin-top:20px;">
-                    <h3>Description</h3>
-                    <p style="color:#aab4c4;white-space:pre-wrap;">
-                        ${escapeHtml(task.description || "No description available.")}
-                    </p>
-                </div>
-
-                <div style="margin-top:20px;">
-                    <h3>Dependencies</h3>
-                    <p style="color:#aab4c4;">
-                        ${escapeHtml(
-                            Array.isArray(task.dependencies)
-                                ? task.dependencies.join(", ") || "None"
-                                : String(task.dependencies || "None")
-                        )}
-                    </p>
-                </div>
-
-                <div style="margin-top:20px;">
-                    <h3>Result</h3>
-                    <pre id="taskResult"
-                         style="white-space:pre-wrap;color:#aab4c4;background:#0b1018;padding:14px;border-radius:8px;overflow:auto;">Loading result...</pre>
-                </div>
-
-                <div style="margin-top:20px;">
-                    <h3>Execution History</h3>
-                    <div id="taskHistory" style="color:#aab4c4;">Loading history...</div>
-                </div>
-            </div>
-        `;
-
-        document.getElementById("backToTasks").addEventListener("click", refreshTasks);
-
-        const resultElement = document.getElementById("taskResult");
-
-        try {
-            let result = task.result || "No result available.";
-            try {
-                const parsed = JSON.parse(result);
-                result = parsed.result || result;
-            } catch (_) {}
-            resultElement.textContent = result;
-        } catch (_) {
-            resultElement.textContent = "No result available.";
-        }
-
-        try {
-            const historyData = await api(`/tasks/${encodeURIComponent(task.id)}/history`);
-            const history = historyData.history || [];
-
-            document.getElementById("taskHistory").innerHTML =
-                history.length
-                    ? history.map(item => `
-                        <div class="task" style="margin-bottom:8px;">
-                            <div class="task-top">
-                                <span class="task-name">
-                                    Attempt ${escapeHtml(item.attempt ?? "")}
-                                </span>
-                                <span class="badge">
-                                    ${escapeHtml(item.status || "unknown")}
-                                </span>
-                            </div>
-                            <div class="task-meta">
-                                Agent: ${escapeHtml(item.agent || "")}
-                                · Provider: ${escapeHtml(item.provider || "unknown")}
-                            </div>
-                        </div>
-                    `).join("")
-                    : "No execution history available.";
-        } catch (error) {
-            document.getElementById("taskHistory").textContent =
-                `History unavailable: ${error.message}`;
-        }
-    }
-
-    document.getElementById("taskSearch").addEventListener("input", renderTaskList);
-    document.getElementById("taskStatusFilter").addEventListener("change", renderTaskList);
-
-    await refreshTasks();
-}
-
-
-
-async function renderExecution() {
-    const main = document.querySelector(".main");
-    if (!main) return;
-
-    main.innerHTML = `
-        <header class="topbar">
-            <div>
-                <h1>Execution</h1>
-                <div class="subtitle">Inspect real Nex AI execution history, providers, attempts, and recovery.</div>
-            </div>
-            <div class="status">
-                <span class="dot online"></span>
-                Nex AI Online
-            </div>
-        </header>
-
-        <section class="card">
-            <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
-                <select id="executionTaskSelect"
-                    style="flex:1;min-width:260px;padding:12px;border-radius:8px;border:1px solid #263044;background:#111722;color:#fff;">
-                    <option value="">Loading tasks...</option>
-                </select>
-                <span id="executionStatus"
-                    style="padding:7px 10px;border-radius:999px;background:#102d20;color:#4ade80;font-size:12px;">
-                    Ready
-                </span>
-            </div>
-
-            <div id="executionHistory"
-                style="margin-top:18px;">
-                <div class="task-meta">Select a task to inspect execution history.</div>
-            </div>
-        </section>
-    `;
-
-    const select = document.getElementById("executionTaskSelect");
-    const historyContainer = document.getElementById("executionHistory");
-    const status = document.getElementById("executionStatus");
-
-    try {
-        const data = await api("/tasks");
-        const tasks = data.tasks || [];
-
-        select.innerHTML = "";
-
-        if (!tasks.length) {
-            select.innerHTML = '<option value="">No tasks available</option>';
-            historyContainer.innerHTML =
-                '<div class="task-meta">No tasks available.</div>';
-            return;
-        }
-
-        tasks.slice().reverse().forEach(task => {
-            const option = document.createElement("option");
-            option.value = task.id;
-            option.textContent =
-                `${task.id} — ${task.title} [${task.status}]`;
-            select.appendChild(option);
-        });
-
-        const loadHistory = async (taskId) => {
-            if (!taskId) return;
-
-            historyContainer.innerHTML =
-                '<div class="task-meta">Loading execution history...</div>';
-            status.textContent = "Loading";
-
-            try {
-                const data = await api(`/tasks/${encodeURIComponent(taskId)}/history`);
-                const history = data.history || [];
-
-                if (!history.length) {
-                    historyContainer.innerHTML =
-                        '<div class="task-meta">No execution history recorded for this task.</div>';
-                    status.textContent = "No history";
-                    return;
-                }
-
-                historyContainer.innerHTML = `
-                    <div style="margin-bottom:14px;">
-                        <strong>${escapeHtml(taskId)}</strong>
-                        <span class="task-meta">
-                            · ${history.length} execution${history.length === 1 ? "" : "s"}
-                        </span>
-                    </div>
-                    ${history.map((entry, index) => `
-                        <div style="padding:16px 0;border-bottom:1px solid #202838;">
-                            <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;">
-                                <strong>Execution #${history.length - index} · Attempt ${escapeHtml(String(entry.attempt ?? 1))}</strong>
-                                <span class="badge">${escapeHtml(entry.status || "unknown")}</span>
-                            </div>
-
-                            <div class="task-meta" style="margin-top:8px;">
-                                Agent: ${escapeHtml(entry.agent || "Unknown")}
-                                · Provider: ${escapeHtml(entry.provider || "Unknown")}
-                                · Recovery: ${escapeHtml(entry.recovery || "none")}
-                            </div>
-
-                            <div class="task-meta" style="margin-top:5px;">
-                                ${escapeHtml(entry.created_at || "")}
-                            </div>
-
-                            ${entry.failure_analysis ? `
-                                <details style="margin-top:12px;">
-                                    <summary style="cursor:pointer;color:#8da2ff;">
-                                        Failure analysis
-                                    </summary>
-                                    <pre style="white-space:pre-wrap;overflow:auto;margin-top:10px;color:#9aa6b5;">${escapeHtml(entry.failure_analysis)}</pre>
-                                </details>
-                            ` : ""}
-
-                            ${entry.result ? `
-                                <details style="margin-top:12px;">
-                                    <summary style="cursor:pointer;color:#8da2ff;">
-                                        Execution result
-                                    </summary>
-                                    <pre style="white-space:pre-wrap;overflow:auto;margin-top:10px;color:#9aa6b5;max-height:420px;">${escapeHtml(entry.result)}</pre>
-                                </details>
-                            ` : ""}
-                        </div>
-                    `).join("")}
-                `;
-
-                status.textContent = `${history.length} execution${history.length === 1 ? "" : "s"}`;
-            } catch (error) {
-                console.error("Execution history error:", error);
-                historyContainer.innerHTML =
-                    `<div class="task-meta">Unable to load execution history: ${escapeHtml(error.message)}</div>`;
-                status.textContent = "Error";
-            }
-        };
-
-        select.addEventListener("change", () => {
-            loadHistory(select.value);
-        });
-
-        await loadHistory(select.value);
-    } catch (error) {
-        console.error("Execution task loading error:", error);
-        select.innerHTML = '<option value="">Unable to load tasks</option>';
-        historyContainer.innerHTML =
-            `<div class="task-meta">Unable to load tasks: ${escapeHtml(error.message)}</div>`;
-        status.textContent = "Error";
-    }
-}

@@ -462,6 +462,30 @@ def get_task_history(task_id: str):
 
 
 
+@app.get("/agents/{agent}/history")
+def get_agent_history(agent: str):
+    connection = get_db()
+
+    rows = connection.execute(
+        """
+        SELECT id, task_id, agent, attempt, provider, status,
+               result, failure_analysis, recovery, created_at
+        FROM execution_history
+        WHERE LOWER(agent) = LOWER(?)
+        ORDER BY id DESC
+        """,
+        (agent,),
+    ).fetchall()
+
+    connection.close()
+
+    return {
+        "agent": agent,
+        "total_executions": len(rows),
+        "history": [dict(row) for row in rows],
+    }
+
+
 @app.get("/agents/{agent}/memory")
 def get_agent_memory_endpoint(agent: str):
     memories = get_agent_memory(agent)
