@@ -474,6 +474,148 @@ document.addEventListener("DOMContentLoaded", () => {
     document.addEventListener("DOMContentLoaded", setupNavigation);
 })();
 
+async function renderExecution() {
+    const main = document.querySelector(".main");
+    if (!main) return;
+
+    const agents = [
+        "researcher",
+        "analyst",
+        "writer",
+        "designer",
+        "reviewer",
+        "executor"
+    ];
+
+    main.innerHTML = `
+        <header class="topbar">
+            <div>
+                <h1>Execution Workspace</h1>
+                <div class="subtitle">Live execution history across the Nex AI workforce.</div>
+            </div>
+            <div class="status">
+                <span class="dot online"></span>
+                Nex AI Online
+            </div>
+        </header>
+
+        <section class="stats">
+            <div class="card">
+                <div class="stat-label">Total Executions</div>
+                <div class="stat-value" id="executionTotalCount">—</div>
+            </div>
+            <div class="card">
+                <div class="stat-label">Completed</div>
+                <div class="stat-value" id="executionCompletedCount">—</div>
+            </div>
+            <div class="card">
+                <div class="stat-label">Failed</div>
+                <div class="stat-value" id="executionFailedCount">—</div>
+            </div>
+            <div class="card">
+                <div class="stat-label">Running</div>
+                <div class="stat-value" id="executionRunningCount">—</div>
+            </div>
+        </section>
+
+        <section class="card" style="margin-top:18px;">
+            <div class="card-header">
+                <h2>Recent Executions</h2>
+                <span class="view" id="executionWorkspaceStatus">Loading...</span>
+            </div>
+
+            <div id="executionWorkspaceList" style="margin-top:14px;">
+                Loading executions...
+            </div>
+        </section>
+    `;
+
+    try {
+        const tasksData = await api("/tasks");
+        const tasks = tasksData.tasks || [];
+
+        const historyResponses = await Promise.all(
+            agents.map(async agent => {
+                const data = await api(`/agents/${encodeURIComponent(agent)}/history`);
+                return data.history || [];
+            })
+        );
+
+        const executions = historyResponses
+            .flat()
+            .sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
+
+        const completed = executions.filter(item => item.status === "completed").length;
+        const failed = executions.filter(item => item.status === "failed").length;
+        const running = executions.filter(item => item.status === "running").length;
+
+        document.getElementById("executionTotalCount").textContent = executions.length;
+        document.getElementById("executionCompletedCount").textContent = completed;
+        document.getElementById("executionFailedCount").textContent = failed;
+        document.getElementById("executionRunningCount").textContent = running;
+        document.getElementById("executionWorkspaceStatus").textContent =
+            `${executions.length} execution${executions.length === 1 ? "" : "s"}`;
+
+        const container = document.getElementById("executionWorkspaceList");
+
+        if (!executions.length) {
+            container.innerHTML =
+                '<div class="task-meta">No executions recorded yet.</div>';
+            return;
+        }
+
+        container.innerHTML = executions.slice(0, 20).map(execution => {
+            const task = tasks.find(item => item.id === execution.task_id);
+
+            return `
+                <div class="task" data-workspace-execution-id="${escapeHtml(String(execution.id ?? ""))}" style="margin-bottom:10px;cursor:pointer;">
+                    <div class="task-top">
+                        <span class="task-name">
+                            Execution #${escapeHtml(String(execution.id ?? "—"))}
+                        </span>
+                        <span class="badge">
+                            ${escapeHtml(execution.status || "unknown")}
+                        </span>
+                    </div>
+
+                    <div style="font-weight:600;margin-top:8px;">
+                        ${escapeHtml(task?.title || execution.task_id || "Unknown task")}
+                    </div>
+
+                    <div class="task-meta" style="margin-top:6px;">
+                        Task: ${escapeHtml(execution.task_id || "—")}
+                        · Agent: ${escapeHtml(execution.agent || "—")}
+                        · Provider: ${escapeHtml(execution.provider || "—")}
+                    </div>
+
+                    <div class="task-meta" style="margin-top:5px;">
+                        Attempt: ${escapeHtml(String(execution.attempt ?? "—"))}
+                        · ${escapeHtml(execution.created_at || "—")}
+                    </div>
+                </div>
+            `;
+        }).join("");
+
+        container.querySelectorAll("[data-workspace-execution-id]").forEach(row => {
+            row.addEventListener("click", () => {
+                const execution = executions.find(
+                    item => String(item.id) === row.dataset.workspaceExecutionId
+                );
+                if (execution) {
+                    showExecutionDetails(execution, () => renderExecution());
+                }
+            });
+        });
+    } catch (error) {
+        console.error("Execution workspace error:", error);
+
+        document.getElementById("executionWorkspaceList").innerHTML =
+            `<div class="task-meta">Unable to load executions: ${escapeHtml(error.message)}</div>`;
+
+        document.getElementById("executionWorkspaceStatus").textContent = "Error";
+    }
+}
+
 async function renderMemory() {
     const main = document.querySelector(".main");
     if (!main) return;
@@ -1273,3 +1415,98 @@ async function showAgentMemory(agentKey, agents) {
     }
 }
 
+async function showExecutionDetails(execution, backAction) {
+    const main = document.querySelector(".main");
+    if (!main || !execution) return;
+
+    main.innerHTML = `
+        <header class="topbar">
+            <div>
+                <h1>Execution Details</h1>
+                <div class="subtitle">Nex AI execution record</div>
+            </div>
+            <div class="status">
+                <span class="dot online"></span>
+                Nex AI Online
+            </div>
+        </header>
+
+        <section class="card">
+            <button id="backFromExecutionDetails"
+                style="padding:9px 14px;border:0;border-radius:7px;background:#1b2535;color:#fff;cursor:pointer;margin-bottom:18px;">
+                ← Back
+            </button>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px;">
+                <div>
+                    <div style="font-size:24px;font-weight:700;">
+                        Execution #${escapeHtml(String(execution.id ?? "—"))}
+                    </div>
+                    <div class="task-meta" style="margin-top:5px;">
+                        Task ${escapeHtml(execution.task_id || "Unknown task")}
+                    </div>
+                </div>
+                <span class="badge">
+                    ${escapeHtml(execution.status || "unknown")}
+                </span>
+            </div>
+
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:22px;">
+                <div class="card">
+                    <div class="stat-label">Agent</div>
+                    <div style="font-weight:600;margin-top:6px;">
+                        ${escapeHtml(execution.agent || "—")}
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="stat-label">Attempt</div>
+                    <div style="font-weight:600;margin-top:6px;">
+                        ${escapeHtml(String(execution.attempt ?? "—"))}
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="stat-label">Provider</div>
+                    <div style="font-weight:600;margin-top:6px;">
+                        ${escapeHtml(execution.provider || "—")}
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="stat-label">Created</div>
+                    <div style="font-weight:600;margin-top:6px;">
+                        ${escapeHtml(execution.created_at || "—")}
+                    </div>
+                </div>
+            </div>
+
+            <div style="margin-bottom:22px;">
+                <h2>Recovery</h2>
+                <div class="task-meta" style="white-space:pre-wrap;margin-top:10px;">
+                    ${escapeHtml(execution.recovery || "No recovery action recorded.")}
+                </div>
+            </div>
+
+            <div style="margin-bottom:22px;">
+                <h2>Failure Analysis</h2>
+                <div class="task-meta" style="white-space:pre-wrap;margin-top:10px;">
+                    ${escapeHtml(execution.failure_analysis || "No failure analysis recorded.")}
+                </div>
+            </div>
+
+            <div>
+                <h2>Execution Result</h2>
+                <div class="task-meta" style="white-space:pre-wrap;margin-top:10px;">
+                    ${formatExecutionResult(execution.result)}
+                </div>
+            </div>
+        </section>
+    `;
+
+    document.getElementById("backFromExecutionDetails").addEventListener("click", () => {
+        if (typeof backAction === "function") {
+            backAction();
+        }
+    });
+}
