@@ -16,3 +16,7 @@ __pycache__/
 
 *.phase5-backup
 *.phase6-backup
+
+# Local backup files
+*.backup
+*.backup-*

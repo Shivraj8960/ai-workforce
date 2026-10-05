@@ -1,7 +1,25 @@
 const API_BASE = "http://127.0.0.1:8000";
+let authToken = null;
 
-async function api(path) {
-    const response = await fetch(`${API_BASE}${path}`);
+async function api(path, options = {}) {
+    const fetchOptions = { ...options };
+
+        if (authToken) {
+        fetchOptions.headers = {
+            ...fetchOptions.headers,
+            "Authorization": `Bearer ${authToken}`
+        };
+    }
+
+    if (fetchOptions.body && typeof fetchOptions.body !== "string") {
+        fetchOptions.headers = {
+            "Content-Type": "application/json",
+            ...fetchOptions.headers
+        };
+        fetchOptions.body = JSON.stringify(fetchOptions.body);
+    }
+
+    const response = await fetch(`${API_BASE}${path}`, fetchOptions);
 
     if (!response.ok) {
         throw new Error(`API ${response.status}: ${response.statusText}`);
@@ -222,7 +240,7 @@ async function createWorkforceGoal() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-    loadDashboard();
+    setTimeout(showLoginScreen, 0);
 
     const button = document.getElementById("createGoalBtn");
 
@@ -441,7 +459,9 @@ document.addEventListener("DOMContentLoaded", () => {
                     renderMemory();
                 } else if (item.textContent.trim() === "Execution") {
                     renderExecution();
-                } else if (item.textContent.trim() === "Dashboard") {
+                } else if (item.textContent.trim() === "Customer Workspace") {
+                  renderCustomerWorkspace();
+              } else if (item.textContent.trim() === "Dashboard") {
                     main.innerHTML = dashboardHTML;
                     loadDashboard();
                 } else {
@@ -473,6 +493,274 @@ document.addEventListener("DOMContentLoaded", () => {
 
     document.addEventListener("DOMContentLoaded", setupNavigation);
 })();
+
+
+async function renderCustomerWorkspace() {
+    const main = document.querySelector(".main");
+    if (!main) return;
+
+    main.innerHTML = `
+        <header class="topbar">
+            <div>
+                <h1>Customer Workspace</h1>
+                <div class="subtitle">Turn your goals into AI-powered workflows.</div>
+            </div>
+            <div class="status">
+                <span class="dot online"></span>
+                Nex AI Online
+            </div>
+        </header>
+
+        <section class="card" style="margin-bottom:24px;">
+            <div class="card-header">
+                <h2>Start a New Project</h2>
+            </div>
+            <p style="color:#8d98aa;line-height:1.6;margin:12px 0 18px;">
+                Create a project and let the AI workforce turn your goal into an actionable plan.
+            </p>
+            <form id="customerGoalForm">
+                <label for="customerProjectName" style="display:block;margin-bottom:8px;font-weight:600;">
+                    Project name
+                </label>
+                <input
+                    id="customerProjectName"
+                    name="projectName"
+                    required
+                    minlength="2"
+                    maxlength="120"
+                    placeholder="Example: Business Launch"
+                    style="width:100%;box-sizing:border-box;padding:14px;border:1px solid #293447;border-radius:10px;background:#0b111a;color:#e5eaf2;font:inherit;margin-bottom:16px;"
+                >
+                <label for="customerGoal" style="display:block;margin-bottom:8px;font-weight:600;">
+                    What would you like Nex AI to do?
+                </label>
+                <textarea
+                    id="customerGoal"
+                    name="goal"
+                    required
+                    minlength="5"
+                    rows="5"
+                    placeholder="Example: Research the market and create a launch plan for my new business."
+                    style="width:100%;box-sizing:border-box;padding:14px;border:1px solid #293447;border-radius:10px;background:#0b111a;color:#e5eaf2;resize:vertical;font:inherit;"
+                ></textarea>
+                <div style="display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap;">
+                    <button type="submit" id="generateCustomerPlan" class="btn">
+                        Create Project & Generate Plan
+                    </button>
+                    <span id="customerPlanMessage" class="task-meta" role="status" aria-live="polite"></span>
+                </div>
+            </form>
+        </section>
+
+        <section class="card" style="margin-bottom:24px;">
+            <div class="card-header">
+                <h2>My Projects</h2>
+                <span class="view" id="customerProjectCount">Loading...</span>
+            </div>
+            <div id="customerProjectList" style="margin-top:14px;">
+                <div class="task-meta">Loading saved projects...</div>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="card-header">
+                <h2 id="customerPlanHeading">Project Plan</h2>
+                <span class="view" id="customerPlanCount">No plan selected</span>
+            </div>
+            <div id="customerPlanTasks" style="margin-top:14px;">
+                <div class="task-meta">Create a project or open a saved project to view its tasks.</div>
+            </div>
+        </section>
+    `;
+
+    const form = document.getElementById("customerGoalForm");
+    const button = document.getElementById("generateCustomerPlan");
+    const message = document.getElementById("customerPlanMessage");
+    const taskContainer = document.getElementById("customerPlanTasks");
+    const count = document.getElementById("customerPlanCount");
+    const projectList = document.getElementById("customerProjectList");
+    const projectCount = document.getElementById("customerProjectCount");
+    const planHeading = document.getElementById("customerPlanHeading");
+
+    function renderTasks(tasks) {
+        if (!tasks.length) {
+            taskContainer.innerHTML =
+                '<div class="task-meta">No tasks have been created for this project yet.</div>';
+            return;
+        }
+
+        taskContainer.innerHTML = tasks.map(task => `
+            <div class="task" style="margin-bottom:10px;">
+                <div class="task-top">
+                    <span class="task-name">${escapeHtml(task.title || task.id || "Untitled task")}</span>
+                    <span class="badge">${escapeHtml(task.status || "pending")}</span>
+                </div>
+                <div class="task-meta" style="margin-top:8px;">
+                    ${escapeHtml(task.id || "No task ID")}
+                    · ${escapeHtml(task.assigned_to || "Unassigned")}
+                <p style="color:#8d98aa;line-height:1.5;margin:10px 0 0;">
+    ${escapeHtml(task.description || "No description provided.")}
+</p>
+
+<button
+    type="button"
+    class="btn customer-execute-task"
+    data-task-id="${escapeHtml(task.id || "")}"
+    style="margin-top:12px;"
+>
+    Execute Task
+</button>
+</div>
+        `).join("");
+    }
+
+    async function loadProjects() {
+        projectList.innerHTML = '<div class="task-meta">Loading saved projects...</div>';
+
+        try {
+            const data = await api("/projects");
+            const projects = data.projects || [];
+            projectCount.textContent = `${data.total_projects || 0} projects`;
+
+            if (!projects.length) {
+                projectList.innerHTML =
+                    '<div class="task-meta">No saved projects yet. Create your first project above.</div>';
+                return;
+            }
+
+            projectList.innerHTML = projects.map(project => {
+                const total = Number(project.total_tasks || 0);
+                const completed = Number(project.completed_tasks || 0);
+                const progress = total ? Math.round(completed / total * 100) : 0;
+
+                return `
+                    <div class="task" style="margin-bottom:12px;">
+                        <div class="task-top">
+                            <span class="task-name">${escapeHtml(project.name)}</span>
+                            <span class="badge">${escapeHtml(project.status || "active")}</span>
+                        </div>
+                        <p style="color:#8d98aa;line-height:1.5;margin:8px 0;">
+                            ${escapeHtml(project.goal)}
+                        </p>
+                        <div class="task-meta">
+                            ${total} tasks · ${completed} completed · ${progress}% progress
+                        </div>
+                        <div style="height:6px;background:#293447;border-radius:6px;margin:10px 0;overflow:hidden;">
+                            <div style="height:100%;width:${progress}%;background:#22c55e;border-radius:6px;"></div>
+                        </div>
+                        <button type="button" class="btn customer-open-project"
+                            data-project-id="${escapeHtml(project.id)}"
+                            style="margin-top:4px;">
+                            View Project
+                        </button>
+                    </div>
+                `;
+            }).join("");
+        } catch (error) {
+            projectCount.textContent = "Unavailable";
+            projectList.innerHTML =
+                `<div class="task-meta">${escapeHtml(error.message)}. Please refresh the workspace.</div>`;
+        }
+    }
+
+    projectList.addEventListener("click", async event => {
+        const projectButton = event.target.closest(".customer-open-project");
+        if (!projectButton) return;
+
+        const projectId = projectButton.dataset.projectId;
+        projectButton.disabled = true;
+        projectButton.textContent = "Loading...";
+
+        try {
+            const data = await api(`/projects/${encodeURIComponent(projectId)}`);
+
+            if (!data.project) {
+                throw new Error(data.error || "Project details are unavailable.");
+            }
+
+            planHeading.textContent = data.project.name;
+            count.textContent = `${data.total_tasks} tasks · ${data.progress_percent}% complete`;
+            renderTasks(data.tasks || []);
+            document.getElementById("customerPlanTasks").scrollIntoView({
+                behavior: "smooth",
+                block: "start"
+            });
+            message.textContent = `Opened ${data.project.name}.`;
+        } catch (error) {
+            message.textContent = error.message;
+        } finally {
+            projectButton.disabled = false;
+            projectButton.textContent = "View Project";
+        }
+    });
+
+    form.addEventListener("submit", async event => {
+        event.preventDefault();
+
+        const name = document.getElementById("customerProjectName").value.trim();
+        const goal = document.getElementById("customerGoal").value.trim();
+
+        if (name.length < 2 || !goal) {
+            message.textContent = "Enter a project name and goal.";
+            return;
+        }
+
+        button.disabled = true;
+        button.textContent = "Creating...";
+        message.textContent = "Saving your project...";
+        taskContainer.innerHTML = '<div class="task-meta">Creating your project...</div>';
+        count.textContent = "In progress";
+
+        let project = null;
+
+        try {
+            const created = await api("/projects", {
+                method: "POST",
+                body: { name, goal }
+            });
+
+            if (created.status !== "project_created" || !created.project?.id) {
+                throw new Error(created.error || "Project creation failed.");
+            }
+
+            project = created.project;
+            planHeading.textContent = project.name;
+            message.textContent = "Project saved. Generating the AI plan...";
+            taskContainer.innerHTML = '<div class="task-meta">AI planning in progress...</div>';
+
+            const data = await api("/plan", {
+                method: "POST",
+                body: { goal, project_id: project.id }
+            });
+
+            if (data.status !== "plan_created" || !data.plan?.tasks) {
+                throw new Error(data.error || "Project saved, but AI planning failed. You can retry later.");
+            }
+
+            const tasks = data.plan.tasks;
+            count.textContent = `${tasks.length} tasks · 0% complete`;
+            renderTasks(tasks);
+            message.textContent = "Project and AI plan created successfully.";
+            form.reset();
+        } catch (error) {
+            count.textContent = "Plan unavailable";
+            message.textContent = error.message;
+            if (project) {
+                taskContainer.innerHTML =
+                    '<div class="task-meta">Your project has been saved. You can open it from My Projects and retry planning later.</div>';
+            } else {
+                taskContainer.innerHTML =
+                    '<div class="task-meta">Project creation failed. Please try again.</div>';
+            }
+        } finally {
+            button.disabled = false;
+            button.textContent = "Create Project & Generate Plan";
+            await loadProjects();
+        }
+    });
+
+    await loadProjects();
+}
 
 async function renderExecution() {
     const main = document.querySelector(".main");
@@ -1507,6 +1795,92 @@ async function showExecutionDetails(execution, backAction) {
     document.getElementById("backFromExecutionDetails").addEventListener("click", () => {
         if (typeof backAction === "function") {
             backAction();
+        }
+    });
+}
+
+
+function showLoginScreen() {
+    const main = document.querySelector(".main");
+    if (!main) return;
+
+    main.innerHTML = `
+        <div style="max-width:460px;margin:80px auto;">
+            <section class="card">
+                <div style="font-size:30px;font-weight:750;margin-bottom:8px;">
+                    Nex<span style="color:#35d07f;">AI</span>
+                </div>
+
+                <div class="subtitle" style="margin-bottom:24px;">
+                    Sign in to your customer workspace.
+                </div>
+
+                <form id="loginForm">
+                    <label style="display:block;color:#aab5c5;font-size:13px;margin-bottom:7px;">
+                        Email
+                    </label>
+
+                    <input
+                        id="loginEmail"
+                        type="email"
+                        autocomplete="email"
+                        required
+                        style="width:100%;box-sizing:border-box;padding:12px;border-radius:8px;border:1px solid #263143;background:#111822;color:#f4f7fb;margin-bottom:16px;"
+                    >
+
+                    <label style="display:block;color:#aab5c5;font-size:13px;margin-bottom:7px;">
+                        Password
+                    </label>
+
+                    <input
+                        id="loginPassword"
+                        type="password"
+                        autocomplete="current-password"
+                        required
+                        style="width:100%;box-sizing:border-box;padding:12px;border-radius:8px;border:1px solid #263143;background:#111822;color:#f4f7fb;margin-bottom:16px;"
+                    >
+
+                    <button
+                        type="submit"
+                        id="loginButton"
+                        style="width:100%;padding:12px;border:0;border-radius:8px;background:#35d07f;color:#08110c;font-weight:700;cursor:pointer;"
+                    >
+                        Sign In
+                    </button>
+
+                    <div
+                        id="loginMessage"
+                        style="margin-top:14px;color:#8f9bad;font-size:13px;"
+                    ></div>
+                </form>
+            </section>
+        </div>
+    `;
+        document.getElementById("loginForm").addEventListener("submit", async event => {
+        event.preventDefault();
+
+        const email = document.getElementById("loginEmail").value.trim();
+        const password = document.getElementById("loginPassword").value;
+        const message = document.getElementById("loginMessage");
+
+        try {
+            const response = await fetch(`${API_BASE}/auth/login`, {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ email, password })
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(data.detail || "Login failed.");
+            }
+
+            authToken = data.access_token;
+            message.textContent = "Signed in successfully.";
+            document.querySelector(".nav-item")?.click();
+        } catch (error) {
+            message.textContent = error.message;
         }
     });
 }

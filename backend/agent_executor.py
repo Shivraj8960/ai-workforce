@@ -16,7 +16,7 @@ AGENT_CONFIG = {
         "instruction": (
             "Investigate the task systematically. Gather relevant facts, "
             "opportunities, assumptions, and useful evidence. Separate known "
-            "facts from assumptions and identify information that is still missing."
+            "facts from assumptions and identify information that is still missing. Never invent facts, statistics, reports, citations, or URLs. Only claim to have accessed sources if you actually did. Include source names and direct URLs when available. Label important claims as verified, unverified, or assumptions. If external sources cannot be accessed, disclose this limitation and identify evidence gaps."
         ),
         "output": (
             "Return a concise research report with key findings, useful evidence, "

@@ -55,12 +55,24 @@ def execute_with_retries(execute_fn, agent, task_title, task_description, previo
     while True:
         attempts += 1
 
-        execution = execute_fn(
-            agent,
-            task_title,
-            task_description,
-            previous_context,
-        )
+        try:
+            execution = execute_fn(
+                agent,
+                task_title,
+                task_description,
+                previous_context,
+            )
+        except Exception as error:
+            execution = {
+                "agent": str(agent).strip().lower(),
+                "task": task_title,
+                "status": "failed",
+                "provider": None,
+                "result": (
+                    "Execution raised an exception: "
+                    f"{type(error).__name__}: {error}"
+                ),
+            }
 
         if execution.get("status") == "completed":
             execution["attempts"] = attempts
