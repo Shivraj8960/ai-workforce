@@ -22,7 +22,22 @@ async function api(path, options = {}) {
     const response = await fetch(`${API_BASE}${path}`, fetchOptions);
 
     if (!response.ok) {
-        throw new Error(`API ${response.status}: ${response.statusText}`);
+        let errorMessage = `API ${response.status}: ${response.statusText}`;
+
+        try {
+            const errorData = await response.json();
+            if (typeof errorData.detail === "string") {
+                errorMessage = errorData.detail;
+            } else if (errorData.detail?.error) {
+                errorMessage = errorData.detail.error;
+            } else if (typeof errorData.message === "string") {
+                errorMessage = errorData.message;
+            }
+        } catch {
+            // Keep the HTTP status message when the response is not JSON.
+        }
+
+        throw new Error(errorMessage);
     }
 
     return response.json();
@@ -713,20 +728,21 @@ async function renderCustomerWorkspace() {
 
             const status = data.task?.status || "unknown";
 
-if (data.blocked_by) {
-    message.textContent =
-        `Task ${taskId} is waiting for dependency ${data.blocked_by}.`;
-    executeButton.disabled = false;
-    executeButton.textContent = "Try Again";
-} else {
-    message.textContent =
-        status === "completed"
-            ? `Task ${taskId} completed successfully.`
-            : `Task ${taskId} finished with status: ${status}.`;
-
-    executeButton.textContent =
-        status === "completed" ? "Executed" : "Try Again";
-}
+           if (data.blocked_by) {
+               message.textContent =
+                   `Task ${taskId} is waiting for dependency ${data.blocked_by}.`;
+               executeButton.disabled = false;
+               executeButton.textContent = "Try Again";
+           } else if (status === "completed") {
+               message.textContent =
+                   `Task ${taskId} completed successfully.`;
+               executeButton.textContent = "Executed";
+           } else {
+               message.textContent =
+                   `Task ${taskId} finished with status: ${status}.`;
+               executeButton.disabled = false;
+               executeButton.textContent = "Try Again";
+           }
 
             if (data.task) {
                 const projectId = data.task.project_id;
