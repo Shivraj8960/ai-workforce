@@ -33,7 +33,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def api_key_auth(request: Request, call_next):
-    if request.method == "OPTIONS" or request.url.path == "/health":
+    if request.method == "OPTIONS" or request.url.path in {"/health", "/auth/register", "/auth/login"}:
         return await call_next(request)
 
     mode = os.getenv("NEX_ENV", "production").strip().lower()
@@ -62,6 +62,28 @@ async def api_key_auth(request: Request, call_next):
         )
 
     return await call_next(request)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "font-src 'self' data:; "
+        "connect-src 'self' http://127.0.0.1:8000 http://localhost:8000; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    )
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+
+    return response
 
 
 # =========================
