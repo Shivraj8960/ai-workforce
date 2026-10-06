@@ -428,6 +428,16 @@ employees_db = [
 # =========================
 
 def row_to_task(row):
+    dependencies_raw = row["dependencies"]
+    try:
+        dependencies = json.loads(dependencies_raw)
+        if not isinstance(dependencies, list) or not all(
+            isinstance(item, str) for item in dependencies
+        ):
+            dependencies = []
+    except (TypeError, json.JSONDecodeError):
+        dependencies = []
+
     return Task(
         id=row["id"],
         title=row["title"],
@@ -435,7 +445,7 @@ def row_to_task(row):
         assigned_to=row["assigned_to"],
         status=row["status"],
         priority=row["priority"],
-        dependencies=json.loads(row["dependencies"]),
+        dependencies=dependencies,
         result=row["result"],
         approval_status=row["approval_status"],
         provider=row["provider"],
