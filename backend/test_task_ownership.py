@@ -217,8 +217,74 @@ def test_agent_memory_ownership():
 
     finally:
         restore_database(temp_dir, original_database)
+def test_workforce_run_is_owner_scoped():
+    temp_dir, original_database = setup_database()
+    original_execute_task = main.execute_task
+
+    try:
+        connection = main.get_db()
+        connection.execute(
+            """
+            INSERT INTO tasks
+            (id, title, owner_id, status, approval_status)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "TASK-B",
+                "Customer B workforce task",
+                CUSTOMER_B["id"],
+                "pending",
+                "not_required",
+            ),
+        )
+        connection.commit()
+        connection.close()
+
+        executed_task_ids = []
+
+        def fake_execute_task(task_id, customer):
+            executed_task_ids.append((task_id, customer["id"]))
+
+            connection = main.get_db()
+            try:
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'completed'
+                    WHERE id = ? AND owner_id = ?
+                    """,
+                    (task_id, customer["id"]),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            return {
+                "message": "Task executed successfully",
+                "task": main.get_task_from_db_for_owner(
+                    task_id,
+                    customer["id"],
+                ),
+                "result": "mocked execution",
+            }
+
+        main.execute_task = fake_execute_task
+
+        result = main.run_workforce(CUSTOMER_A)
+
+        assert ("TASK-A", CUSTOMER_A["id"]) in executed_task_ids
+        assert ("TASK-B", CUSTOMER_B["id"]) not in executed_task_ids
+        assert all(owner_id == CUSTOMER_A["id"] for _, owner_id in executed_task_ids)
+
+        print("PASS: workforce run ownership isolation")
+    finally:
+        main.execute_task = original_execute_task
+        restore_database(temp_dir, original_database)
+
+
 if __name__ == "__main__":
     test_approval_and_rejection_ownership()
     test_execute_requires_customer_ownership()
     test_agent_memory_ownership()
+    test_workforce_run_is_owner_scoped()
     print("ALL TASK OWNERSHIP TESTS PASSED")
