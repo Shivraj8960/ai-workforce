@@ -772,8 +772,12 @@ def create_plan(
     try:
         raw_plan = generate_plan(request.goal)
         planned_tasks = json.loads(raw_plan)
-    except Exception as e:
-        return {"goal": request.goal, "status": "planning_failed", "error": str(e)}
+    except Exception:
+        return {
+            "goal": request.goal,
+            "status": "planning_failed",
+            "error": "AI planning failed due to an internal error.",
+        }
 
     if not isinstance(planned_tasks, list) or not 3 <= len(planned_tasks) <= 7:
         return {"goal": request.goal, "status": "planning_failed", "error": "AI planner must return between 3 and 7 tasks"}
