@@ -155,7 +155,70 @@ def test_execute_requires_customer_ownership():
     print("PASS: execute_task requires customer ownership context")
 
 
+def test_agent_memory_ownership():
+    temp_dir, original_database = setup_database()
+
+    try:
+        connection = main.get_db()
+
+        connection.execute(
+            """
+            INSERT INTO tasks
+            (id, title, owner_id, status, approval_status)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "TASK-B",
+                "Customer B memory task",
+                CUSTOMER_B["id"],
+                "completed",
+                "approved",
+            ),
+        )
+
+        connection.execute(
+            """
+            INSERT INTO agent_memory
+            (agent, task_id, memory)
+            VALUES (?, ?, ?)
+            """,
+            ("Researcher", "TASK-A", "Memory belonging to Customer A"),
+        )
+
+        connection.execute(
+            """
+            INSERT INTO agent_memory
+            (agent, task_id, memory)
+            VALUES (?, ?, ?)
+            """,
+            ("Researcher", "TASK-B", "Memory belonging to Customer B"),
+        )
+
+        connection.commit()
+        connection.close()
+
+        memories_a = main.get_agent_memory(
+            "Researcher",
+            owner_id=CUSTOMER_A["id"],
+        )
+
+        memories_b = main.get_agent_memory(
+            "Researcher",
+            owner_id=CUSTOMER_B["id"],
+        )
+
+        assert len(memories_a) == 1
+        assert memories_a[0]["memory"] == "Memory belonging to Customer A"
+
+        assert len(memories_b) == 1
+        assert memories_b[0]["memory"] == "Memory belonging to Customer B"
+
+        print("PASS: agent memory ownership isolation")
+
+    finally:
+        restore_database(temp_dir, original_database)
 if __name__ == "__main__":
     test_approval_and_rejection_ownership()
     test_execute_requires_customer_ownership()
+    test_agent_memory_ownership()
     print("ALL TASK OWNERSHIP TESTS PASSED")
