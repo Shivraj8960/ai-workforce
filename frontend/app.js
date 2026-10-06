@@ -694,6 +694,61 @@ async function renderCustomerWorkspace() {
         }
     });
 
+    taskContainer.addEventListener("click", async event => {
+        const executeButton = event.target.closest(".customer-execute-task");
+        if (!executeButton) return;
+
+        const taskId = executeButton.dataset.taskId;
+        if (!taskId) return;
+
+        executeButton.disabled = true;
+        executeButton.textContent = "Executing...";
+        message.textContent = `Executing ${taskId}...`;
+
+        try {
+            const data = await api(
+                `/tasks/${encodeURIComponent(taskId)}/execute`,
+                { method: "POST" }
+            );
+
+            const status = data.task?.status || "unknown";
+
+if (data.blocked_by) {
+    message.textContent =
+        `Task ${taskId} is waiting for dependency ${data.blocked_by}.`;
+    executeButton.disabled = false;
+    executeButton.textContent = "Try Again";
+} else {
+    message.textContent =
+        status === "completed"
+            ? `Task ${taskId} completed successfully.`
+            : `Task ${taskId} finished with status: ${status}.`;
+
+    executeButton.textContent =
+        status === "completed" ? "Executed" : "Try Again";
+}
+
+            if (data.task) {
+                const projectId = data.task.project_id;
+                if (projectId) {
+                    const projectData = await api(
+                        `/projects/${encodeURIComponent(projectId)}`
+                    );
+
+                    if (projectData.project) {
+                        planHeading.textContent = projectData.project.name;
+                        count.textContent =
+                            `${projectData.total_tasks} tasks · ${projectData.progress_percent}% complete`;
+                        renderTasks(projectData.tasks || []);
+                    }
+                }
+            }
+        } catch (error) {
+            message.textContent = error.message;
+            executeButton.disabled = false;
+            executeButton.textContent = "Try Again";
+        }
+    });
     form.addEventListener("submit", async event => {
         event.preventDefault();
 
