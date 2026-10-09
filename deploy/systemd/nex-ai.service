@@ -1,0 +1,15 @@
+[Unit]
+Description=NEX AI Platform Backend
+After=network.target
+
+[Service]
+Type=simple
+User=shiva
+WorkingDirectory=/home/shiva/nex-ai/backend
+EnvironmentFile=/home/shiva/nex-ai/backend/.env
+ExecStart=/home/shiva/nex-ai/backend/venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
