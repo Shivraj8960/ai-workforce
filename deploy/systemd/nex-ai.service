@@ -7,9 +7,11 @@ Type=simple
 User=shiva
 WorkingDirectory=/home/shiva/nex-ai/backend
 EnvironmentFile=/home/shiva/nex-ai/backend/.env
-ExecStart=/home/shiva/nex-ai/backend/venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000
+ExecStart=/home/shiva/nex-ai/backend/venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 30
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=35
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
