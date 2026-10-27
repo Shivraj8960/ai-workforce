@@ -1,5 +1,6 @@
 from source_validator import validate_sources
 from agent_executor import execute_agent, generate_plan, extract_handoff_context
+from research_report import build_research_task_plan
 from self_healing import analyze_failure, should_retry, execute_with_retries
 from auth import hash_password, verify_password, create_access_token, decode_access_token
 from fastapi import FastAPI, Request, HTTPException, Depends
@@ -509,7 +510,7 @@ def get_task_from_db(task_id: str):
         return row_to_task(row)
 
     return None
-    
+
 def get_task_from_db_for_owner(task_id: str, owner_id: str):
     connection = get_db()
     try:
@@ -758,6 +759,103 @@ def get_project(
         "completed_tasks": completed,
         "progress_percent": round(completed / len(tasks) * 100) if tasks else 0,
         "tasks": tasks
+    }
+
+
+@app.post("/research/report-plan")
+def create_research_report_plan(
+    request: PlanRequest,
+    customer: dict = Depends(get_current_customer)
+):
+    goal = request.goal.strip() if isinstance(request.goal, str) else ""
+    if not goal:
+        raise HTTPException(status_code=422, detail="Research goal cannot be empty")
+
+    planned_tasks = build_research_task_plan(goal)
+    connection = get_db()
+    created_tasks = []
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+
+        if request.project_id:
+            project = connection.execute(
+                "SELECT id FROM projects WHERE id = ? AND owner_id = ?",
+                (request.project_id, customer["id"])
+            ).fetchone()
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+
+        rows = connection.execute(
+            "SELECT id FROM tasks WHERE id LIKE 'TASK-%'"
+        ).fetchall()
+
+        numbers = []
+        for row in rows:
+            try:
+                numbers.append(int(row["id"].split("-")[1]))
+            except (IndexError, ValueError):
+                continue
+
+        first_number = max(numbers, default=0) + 1
+        task_id_map = {
+            i: f"TASK-{first_number + i - 1:03d}"
+            for i in range(1, len(planned_tasks) + 1)
+        }
+
+        for index, item in enumerate(planned_tasks, start=1):
+            dependencies = [
+                task_id_map[int(dep)] for dep in item["dependencies"]
+            ]
+            task = Task(
+                id=task_id_map[index],
+                title=item["title"],
+                description=item["description"],
+                assigned_to=item["assigned_to"],
+                status="pending",
+                priority="medium",
+                dependencies=dependencies,
+                project_id=request.project_id,
+                owner_id=customer["id"],
+            )
+
+            connection.execute(
+                """
+                INSERT INTO tasks
+                (id, title, description, assigned_to, status, priority,
+                 dependencies, result, approval_status, provider,
+                 project_id, owner_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task.id, task.title, task.description, task.assigned_to,
+                    task.status, task.priority, json.dumps(task.dependencies),
+                    task.result, task.approval_status, task.provider,
+                    task.project_id, task.owner_id,
+                ),
+            )
+            created_tasks.append(task)
+
+        connection.commit()
+    except HTTPException:
+        connection.rollback()
+        raise
+    except Exception:
+        connection.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to create the research report plan",
+        )
+    finally:
+        connection.close()
+
+    return {
+        "goal": goal,
+        "status": "plan_created",
+        "workflow": "research_to_report",
+        "review_required": True,
+        "ai_execution_started": False,
+        "plan": {"total_tasks": len(created_tasks), "tasks": created_tasks},
     }
 
 
