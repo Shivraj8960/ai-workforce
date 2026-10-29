@@ -1410,7 +1410,7 @@ def run_workforce(customer: dict = Depends(get_current_customer)):
                     customer["id"],
                 )
 
-                if not dependency or (dependency.status != "completed" and dependency.approval_status != "approved"):
+                if not dependency or dependency.status != "completed":
                     dependencies_ready = False
                     break
 
