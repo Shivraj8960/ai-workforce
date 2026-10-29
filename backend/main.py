@@ -451,6 +451,7 @@ def row_to_task(row):
         approval_status=row["approval_status"],
         provider=row["provider"],
         project_id=row["project_id"] if "project_id" in row.keys() else None,
+        owner_id=row["owner_id"] if "owner_id" in row.keys() else None,
     )
 
 
@@ -1079,22 +1080,28 @@ def execute_task(
         connection.close()
 
     if not row:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Task not found")
 
     task = row_to_task(row)
 
-    # Check dependencies
+    # Fail closed if a dependency is missing, inaccessible, or incomplete.
     for dependency_id in task.dependencies:
+        dependency = get_task_from_db_for_owner(
+            dependency_id,
+            customer["id"],
+        )
 
-        dependency = get_task_from_db_for_owner(dependency_id, customer["id"])
+        if dependency is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Task cannot execute because a dependency is unavailable",
+            )
 
-        if dependency and dependency.status != "completed" and dependency.approval_status != "approved":
-            return {
-                "message": "Task is waiting for dependency",
-                "task": task,
-                "blocked_by": dependency_id
-            }
+        if dependency.status != "completed":
+            raise HTTPException(
+                status_code=409,
+                detail="Task is waiting for a dependency to complete",
+            )
 
     # Atomically claim pending or failed tasks before starting AI execution.
     connection = get_db()
@@ -1116,7 +1123,6 @@ def execute_task(
         connection.close()
 
     if not claimed:
-        from fastapi import HTTPException
         latest_task = get_task_from_db_for_owner(task_id, customer["id"])
         raise HTTPException(
             status_code=409,
@@ -1218,7 +1224,6 @@ def execute_task(
             "result": "Task execution failed due to an internal error.",
         })
         save_task(task)
-        from fastapi import HTTPException
         raise HTTPException(
             status_code=500,
             detail="Task execution failed due to an internal error.",

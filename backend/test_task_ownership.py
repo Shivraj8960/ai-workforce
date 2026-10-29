@@ -1,3 +1,4 @@
+
 import inspect
 import sqlite3
 import tempfile
@@ -280,11 +281,100 @@ def test_workforce_run_is_owner_scoped():
     finally:
         main.execute_task = original_execute_task
         restore_database(temp_dir, original_database)
+def test_execute_rejects_unavailable_dependencies():
+    from fastapi import HTTPException
 
+    cases = [
+        ("MISSING-DEP", None),
+        ("TASK-B", "other_customer"),
+        ("TASK-DEP", "incomplete"),
+    ]
+
+    for dependency_id, dependency_type in cases:
+        temp_dir, original_database = setup_database()
+        original_execute_agent = main.execute_agent
+        agent_calls = []
+
+        def fake_execute_agent(*args, **kwargs):
+            agent_calls.append(args)
+            return {
+                "status": "completed",
+                "agent": "Writer",
+                "provider": "mock",
+                "result": "mock result",
+            }
+
+        try:
+            connection = main.get_db()
+
+            if dependency_type == "other_customer":
+                connection.execute(
+                    """
+                    INSERT INTO tasks
+                    (id, title, owner_id, status, approval_status)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        dependency_id,
+                        "Private task",
+                        CUSTOMER_B["id"],
+                        "completed",
+                        "approved",
+                    ),
+                )
+
+            elif dependency_type == "incomplete":
+                connection.execute(
+                    """
+                    INSERT INTO tasks
+                    (id, title, owner_id, status, approval_status)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        dependency_id,
+                        "Incomplete dependency",
+                        CUSTOMER_A["id"],
+                        "pending",
+                        "not_required",
+                    ),
+                )
+
+            connection.execute(
+                "UPDATE tasks SET dependencies = ? WHERE id = ?",
+                (main.json.dumps([dependency_id]), "TASK-A"),
+            )
+            connection.commit()
+            connection.close()
+
+            main.execute_agent = fake_execute_agent
+
+            try:
+                main.execute_task("TASK-A", CUSTOMER_A)
+            except HTTPException as exc:
+                assert exc.status_code == 409
+                assert dependency_id not in str(exc.detail) or (
+                    dependency_type != "other_customer"
+                )
+            else:
+                raise AssertionError(
+                    f"Expected HTTP 409 for dependency case: {dependency_type}"
+                )
+
+            assert agent_calls == [], (
+                "AI execution must not start when a dependency is unavailable "
+                "or incomplete"
+            )
+
+        finally:
+            main.execute_agent = original_execute_agent
+            restore_database(temp_dir, original_database)
+
+    print("PASS: missing, inaccessible and incomplete dependencies rejected")
 
 if __name__ == "__main__":
     test_approval_and_rejection_ownership()
     test_execute_requires_customer_ownership()
     test_agent_memory_ownership()
     test_workforce_run_is_owner_scoped()
+    test_execute_rejects_unavailable_dependencies()
     print("ALL TASK OWNERSHIP TESTS PASSED")
