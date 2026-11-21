@@ -29,5 +29,7 @@ jobs:
         run: python test_local_agent_client.py
       - name: Test Local Agent schema migrations
         run: python test_agent_migrations.py
+      - name: Test controlled desktop runtime
+        run: python test_desktop_runtime.py
       - name: Test customer ownership isolation
         run: python test_task_ownership.py

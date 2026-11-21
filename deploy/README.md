@@ -159,7 +159,36 @@ Retrieve status and result from `GET /computer/agent/commands/{command_id}`; `GE
 
 The Local Agent connects to `/computer/agent/ws/{device_id}` using its paired credential in an `authenticate` JSON message, then exchanges bounded JSON command/result messages and heartbeats. Production requires `wss`; `ws` is accepted only when `NEX_ENV=development`. The validation-only client can be run with `python local_agent_client.py` after setting `NEX_AGENT_BACKEND_URL`, `NEX_AGENT_DEVICE_ID`, and `NEX_AGENT_CREDENTIAL` in a protected environment file. Do not put credentials in command-line arguments, URLs, source control, or logs. It reconnects with bounded exponential backoff, authenticates on each connection, independently validates the allowlist, and suppresses duplicate command IDs for the lifetime of the client process.
 
-The Local Agent and backend deliberately do not execute desktop actions. The protocol rejects unknown actions and malformed payloads, and returns a structured unsuccessful result without using OS APIs. Do not enable a desktop adapter until authorization, approval, dispatch, Local Agent validation, cancellation behavior, and security tests have been reviewed end-to-end.
+By default, the Local Agent and backend do not execute desktop actions. The protocol rejects unknown actions and malformed payloads, and returns a structured unsuccessful result without using OS APIs. Desktop adapters remain fail closed until opt-in environment gates, capability reporting, authorization, approval, dispatch, validation, cancellation, and security tests are enabled and reviewed end-to-end.
+
+### Controlled desktop execution
+
+Desktop execution is disabled unless all of the following are configured:
+
+```env
+NEX_DESKTOP_EXECUTION_ENABLED=true
+NEX_DESKTOP_EXECUTION_PROFILE=approved
+```
+
+The Local Agent must also report the capability through the authenticated WebSocket and must not run as root. Wayland input and active-window automation are intentionally not implemented as bypasses: X11 requires `xdotool`, while Wayland screen capture requires `grim` and an explicit `NEX_DESKTOP_ALLOW_WAYLAND_CAPTURE=true` setting.
+
+| Action | Payload | Runtime condition | Privacy/bounds |
+|---|---|---|---|
+| `open_app` | `{"app_id":"calculator|browser|text_editor"}` | Opt-in enabled; allowlisted executable found | Fixed executable names; no shell or arbitrary paths |
+| `capture_screen` | `{}` | X11 or explicitly enabled Wayland capture | Writes only to configured capture directory, removes the file after hashing, max 20 MiB |
+| `get_active_window` | `{}` | X11 with `xdotool` | Returns title only, bounded to 200 characters |
+| `input_text` | `{"text":"..."}` | X11 with `xdotool` | 1-500 characters; no keylogging or clipboard collection |
+| `read_file` | `{"path":"relative/path"}` | Explicit filesystem roots | 64 KiB text limit; symlinks and credential/profile paths denied |
+| `write_file` | `{"path":"relative/path","content":"..."}` | Explicit filesystem roots | 64 KiB UTF-8 limit; symlinks and credential/profile paths denied |
+
+Configure restricted filesystem roots as a platform path-list, for example:
+
+```env
+NEX_DESKTOP_FS_ROOTS=/srv/nex-ai-workspace:/home/nex-agent/shared
+NEX_DESKTOP_CAPTURE_DIR=/home/nex-agent/captures
+```
+
+Restrict the capture directory and filesystem roots to dedicated non-privileged directories. `.ssh`, profile/config directories, keyrings, `.env`, `.netrc`, credentials, secrets, and password files are denied. The runtime does not accept executable paths, shell commands, shell redirection, environment-variable expansion, credential paths, or root execution.
 
 ### Persistence, limits, and scaling
 
