@@ -6,6 +6,7 @@ from auth import hash_password, verify_password, create_access_token, decode_acc
 from migrations import apply_migrations, payload_hash
 from local_agent_protocol import ALLOWED_ACTIONS as LOCAL_AGENT_ALLOWED_ACTIONS
 from local_agent_protocol import MAX_MESSAGE_BYTES, parse_message, validate_command
+from desktop_runtime import desktop_execution_enabled
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -272,6 +273,14 @@ def init_db():
         )
         connection.execute(
             """
+            UPDATE agent_execution_sessions
+            SET state = 'failed', ended_at = ?
+            WHERE owner_id = ? AND command_id = ?
+            """,
+            (startup_time, row["owner_id"], row["id"]),
+        )
+        connection.execute(
+            """
             INSERT INTO agent_audit_log
             (owner_id, device_id, command_id, event, details, created_at)
             VALUES (?, ?, ?, 'command_failed', ?, ?)
@@ -306,7 +315,7 @@ def init_db():
 init_db()
 
 
-DESKTOP_EXECUTION_ENABLED = False
+DESKTOP_EXECUTION_ENABLED = desktop_execution_enabled()
 AGENT_COMMAND_TIMEOUT_SECONDS = 15
 AGENT_APPROVAL_TTL_SECONDS = 300
 AGENT_REQUESTS_PER_MINUTE = 20
@@ -354,14 +363,21 @@ class CustomerLogin(BaseModel):
 
 class AgentDeviceCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
-    permissions: List[str] = Field(default_factory=list, max_length=2)
+    permissions: List[str] = Field(default_factory=list, max_length=6)
 
     class Config:
         extra = "forbid"
 
 
 class AgentCommandRequest(BaseModel):
-    action: Literal["open_app", "capture_screen"]
+    action: Literal[
+        "open_app",
+        "capture_screen",
+        "get_active_window",
+        "input_text",
+        "read_file",
+        "write_file",
+    ]
     payload: Dict[str, Any] = Field(default_factory=dict)
     client_request_id: str = Field(min_length=16, max_length=128)
 
@@ -378,7 +394,14 @@ class AgentApprovalDecision(BaseModel):
 
 class AgentCommandResult(BaseModel):
     command_id: StrictStr = Field(min_length=1, max_length=64)
-    action: Literal["open_app", "capture_screen"]
+    action: Literal[
+        "open_app",
+        "capture_screen",
+        "get_active_window",
+        "input_text",
+        "read_file",
+        "write_file",
+    ]
     success: StrictBool
     message: StrictStr = Field(min_length=1, max_length=500)
 
@@ -1698,8 +1721,30 @@ def _validate_agent_action(action, payload):
             or payload["app_id"] not in AGENT_APP_ALLOWLIST
         ):
             raise HTTPException(status_code=422, detail="Application is not allowlisted")
-    elif payload:
-        raise HTTPException(status_code=422, detail="capture_screen does not accept a payload")
+    elif action in {"capture_screen", "get_active_window"}:
+        if payload:
+            raise HTTPException(status_code=422, detail="Action does not accept a payload")
+    elif action == "input_text":
+        if (
+            set(payload) != {"text"}
+            or not isinstance(payload.get("text"), str)
+            or not 1 <= len(payload["text"]) <= 500
+        ):
+            raise HTTPException(status_code=422, detail="Input text is outside the safety limit")
+    elif action in {"read_file", "write_file"}:
+        expected = {"path"} if action == "read_file" else {"path", "content"}
+        if set(payload) != expected:
+            raise HTTPException(status_code=422, detail="Restricted file payload is invalid")
+        if (
+            not isinstance(payload.get("path"), str)
+            or not payload["path"]
+            or len(payload["path"]) > 1024
+        ):
+            raise HTTPException(status_code=422, detail="Restricted file path is invalid")
+        if action == "write_file":
+            content = payload.get("content")
+            if not isinstance(content, str) or len(content.encode("utf-8")) > 65536:
+                raise HTTPException(status_code=422, detail="Restricted file content is too large")
 
 
 def _expire_agent_approvals(connection, owner_id):
@@ -1903,6 +1948,22 @@ async def _revoke_agent_device_locked(device_id, customer):
                 WHERE id = ? AND status IN ('pending_approval', 'approved', 'queued', 'executing')
                 """,
                 (json.dumps(result), now, command["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE agent_execution_sessions
+                SET state = 'cancelled', ended_at = ?
+                WHERE owner_id = ? AND command_id = ?
+                """,
+                (now, customer["id"], command["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE agent_execution_sessions
+                SET state = 'cancelled', ended_at = ?
+                WHERE owner_id = ? AND command_id = ?
+                """,
+                (now, customer["id"], command["id"]),
             )
             _agent_audit(
                 connection,
@@ -2659,6 +2720,51 @@ def _begin_agent_dispatch(command_id, owner_id):
             connection.commit()
             return None
 
+        if DESKTOP_EXECUTION_ENABLED:
+            capability = connection.execute(
+                """
+                SELECT capabilities FROM agent_desktop_capabilities
+                WHERE device_id = ? AND owner_id = ?
+                """,
+                (command["device_id"], owner_id),
+            ).fetchone()
+            capability_allowed = False
+            if capability is not None:
+                try:
+                    reported = json.loads(capability["capabilities"])
+                    capability_allowed = (
+                        reported.get("desktop_execution") is True
+                        and reported.get(command["action"]) is True
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    capability_allowed = False
+            if not capability_allowed:
+                now = _utc_text()
+                result = {
+                    "command_id": command_id,
+                    "action": command["action"],
+                    "success": False,
+                    "message": "Local Agent did not report this desktop capability",
+                }
+                connection.execute(
+                    """
+                    UPDATE agent_commands
+                    SET status = 'failed', result = ?, updated_at = ?
+                    WHERE id = ? AND status = 'approved'
+                    """,
+                    (json.dumps(result), now, command_id),
+                )
+                _agent_audit(
+                    connection,
+                    owner_id,
+                    "command_failed",
+                    device_id=command["device_id"],
+                    command_id=command_id,
+                    details={"reason": "required desktop capability unavailable"},
+                )
+                connection.commit()
+                return None
+
         try:
             current_hash = payload_hash(
                 command["action"],
@@ -2764,6 +2870,24 @@ def _begin_agent_dispatch(command_id, owner_id):
         if claimed != 1:
             connection.rollback()
             return None
+        connection.execute(
+            """
+            INSERT INTO agent_execution_sessions
+            (id, owner_id, device_id, command_id, adapter, state, started_at)
+            VALUES (?, ?, ?, ?, 'desktop_runtime', 'started', ?)
+            ON CONFLICT(command_id) DO UPDATE SET
+                state = 'started',
+                started_at = excluded.started_at,
+                ended_at = NULL
+            """,
+            (
+                str(uuid.uuid4()),
+                owner_id,
+                command["device_id"],
+                command_id,
+                now,
+            ),
+        )
         _agent_audit(
             connection,
             owner_id,
@@ -2806,6 +2930,14 @@ def _fail_agent_command(command_id, owner_id, message):
                 WHERE id = ? AND owner_id = ? AND status = 'executing'
                 """,
                 (json.dumps(result), _utc_text(), command_id, owner_id),
+            )
+            connection.execute(
+                """
+                UPDATE agent_execution_sessions
+                SET state = 'failed', ended_at = ?
+                WHERE owner_id = ? AND command_id = ?
+                """,
+                (_utc_text(), owner_id, command_id),
             )
             _agent_audit(
                 connection,
@@ -2873,18 +3005,58 @@ async def _record_agent_result(device_id, incoming):
             connection.commit()
             return False
 
-        result = {
-            "command_id": incoming.command_id,
-            "action": incoming.action,
-            "success": False,
-            "message": "Desktop execution is disabled; Local Agent result was not accepted as execution.",
-        }
+        capability = connection.execute(
+            """
+            SELECT capabilities FROM agent_desktop_capabilities
+            WHERE device_id = ? AND owner_id = ?
+            """,
+            (device_id, command["owner_id"]),
+        ).fetchone()
+        capability_allowed = False
+        if capability is not None:
+            try:
+                reported = json.loads(capability["capabilities"])
+                capability_allowed = (
+                    DESKTOP_EXECUTION_ENABLED
+                    and reported.get("desktop_execution") is True
+                    and reported.get(incoming.action) is True
+                )
+            except (TypeError, json.JSONDecodeError):
+                capability_allowed = False
+
+        if incoming.success and capability_allowed:
+            status = "completed"
+            result = {
+                "command_id": incoming.command_id,
+                "action": incoming.action,
+                "success": True,
+                "message": incoming.message,
+            }
+            audit_reason = "local desktop action completed"
+        else:
+            status = "failed"
+            if not DESKTOP_EXECUTION_ENABLED:
+                message = "Desktop execution is disabled"
+                audit_reason = "desktop execution disabled"
+            elif not capability_allowed:
+                message = "Desktop capability was unavailable"
+                audit_reason = "desktop capability unavailable"
+            else:
+                message = incoming.message
+                audit_reason = "local desktop action failed"
+            result = {
+                "command_id": incoming.command_id,
+                "action": incoming.action,
+                "success": False,
+                "message": message,
+            }
         connection.execute(
             """
-            UPDATE agent_commands SET status = 'failed', result = ?, updated_at = ?
+            UPDATE agent_commands SET status = ?, result = ?, updated_at = ?
             WHERE id = ? AND owner_id = ? AND device_id = ? AND status = 'executing'
             """,
             (
+                status,
                 json.dumps(result),
                 _utc_text(),
                 incoming.command_id,
@@ -2895,13 +3067,27 @@ async def _record_agent_result(device_id, incoming):
         _agent_audit(
             connection,
             command["owner_id"],
-            "command_failed",
+            "command_completed" if status == "completed" else "command_failed",
             device_id=device_id,
             command_id=incoming.command_id,
             details={
-                "reason": "desktop execution disabled",
+                "reason": audit_reason,
                 "agent_claimed_success": incoming.success,
             },
+        )
+        connection.execute(
+        """
+        UPDATE agent_execution_sessions
+        SET state = ?, ended_at = ?
+        WHERE owner_id = ? AND device_id = ? AND command_id = ?
+        """,
+        (
+            "completed" if status == "completed" else "failed",
+            _utc_text(),
+            command["owner_id"],
+            device_id,
+            incoming.command_id,
+        ),
         )
         connection.commit()
     except Exception:
@@ -3084,6 +3270,60 @@ async def local_agent_websocket(websocket: WebSocket, device_id: str):
                 await websocket.send_json({"type": "heartbeat_ack"})
                 continue
 
+            if message.get("type") == "capabilities" and set(message) == {
+                "type",
+                "capabilities",
+                "session_type",
+            }:
+                capabilities = message["capabilities"]
+                session_type = message["session_type"]
+                if (
+                    not isinstance(capabilities, dict)
+                    or not isinstance(session_type, str)
+                    or len(session_type) > 32
+                    or set(capabilities) - set(LOCAL_AGENT_ALLOWED_ACTIONS) - {
+                        "desktop_execution",
+                        "x11",
+                        "wayland",
+                    }
+                ):
+                    _audit_agent_protocol_failure(owner_id, device_id, "invalid capability message")
+                    await websocket.close(code=1008, reason="Invalid capability message")
+                    return
+                if not all(isinstance(value, bool) for value in capabilities.values()):
+                    _audit_agent_protocol_failure(owner_id, device_id, "invalid capability values")
+                    await websocket.close(code=1008, reason="Invalid capability message")
+                    return
+                connection = get_db()
+                try:
+                    with connection:
+                        connection.execute(
+                            """
+                            INSERT INTO agent_desktop_capabilities
+                            (device_id, owner_id, capabilities, session_type, updated_at)
+                            VALUES (?, ?, ?, ?, ?)
+                            ON CONFLICT(device_id) DO UPDATE SET
+                                owner_id = excluded.owner_id,
+                                capabilities = excluded.capabilities,
+                                session_type = excluded.session_type,
+                                updated_at = excluded.updated_at
+                            """,
+                            (
+                                device_id,
+                                owner_id,
+                                json.dumps(capabilities, sort_keys=True),
+                                session_type,
+                                _utc_text(),
+                            ),
+                        )
+                finally:
+                    connection.close()
+                await websocket.send_json({
+                    "type": "capabilities_ack",
+                    "accepted": True,
+                })
+                continue
+
             try:
                 incoming = AgentCommandResult(**message)
             except ValidationError:
@@ -3166,6 +3406,14 @@ def _fail_disconnected_agent_commands(device_id, owner_id):
                 WHERE id = ? AND status = 'executing'
                 """,
                 (json.dumps(result), _utc_text(), row["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE agent_execution_sessions
+                SET state = 'failed', ended_at = ?
+                WHERE owner_id = ? AND command_id = ?
+                """,
+                (_utc_text(), owner_id, row["id"]),
             )
             _agent_audit(
                 connection,

@@ -395,6 +395,172 @@ def _index_rate_event_expiry(connection):
     )
 
 
+def _expand_desktop_actions_and_add_registries(connection):
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "ALTER TABLE agent_commands RENAME TO agent_commands_phase6_legacy"
+        )
+        connection.execute(
+            "ALTER TABLE agent_approvals RENAME TO agent_approvals_phase6_legacy"
+        )
+        connection.execute(
+            "ALTER TABLE agent_audit_log RENAME TO agent_audit_log_phase6_legacy"
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE agent_commands (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+                device_id TEXT NOT NULL,
+                client_request_id TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN (
+                    'open_app', 'capture_screen', 'get_active_window', 'input_text',
+                    'read_file', 'write_file'
+                )),
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN (
+                    'pending_approval', 'approved', 'denied', 'queued', 'executing',
+                    'completed', 'failed', 'expired', 'cancelled'
+                )),
+                result TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deadline_at TEXT NOT NULL,
+                UNIQUE(owner_id, client_request_id),
+                UNIQUE(id, owner_id),
+                FOREIGN KEY(device_id, owner_id)
+                    REFERENCES agent_devices(id, owner_id) ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO agent_commands
+            (id, owner_id, device_id, client_request_id, action, payload, status,
+             result, created_at, updated_at, deadline_at)
+            SELECT id, owner_id, device_id, client_request_id, action, payload, status,
+                   result, created_at, updated_at, deadline_at
+            FROM agent_commands_phase6_legacy
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE agent_approvals (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+                command_id TEXT NOT NULL UNIQUE,
+                token_hash TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'approved', 'denied', 'expired', 'cancelled')),
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                consumed_at TEXT,
+                FOREIGN KEY(command_id, owner_id)
+                    REFERENCES agent_commands(id, owner_id) ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO agent_approvals
+            (id, owner_id, command_id, token_hash, payload_hash, status,
+             expires_at, created_at, consumed_at)
+            SELECT id, owner_id, command_id, token_hash, payload_hash, status,
+                   expires_at, created_at, consumed_at
+            FROM agent_approvals_phase6_legacy
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE agent_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id TEXT NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+                device_id TEXT REFERENCES agent_devices(id) ON DELETE SET NULL,
+                command_id TEXT REFERENCES agent_commands(id) ON DELETE SET NULL,
+                event TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO agent_audit_log
+            (id, owner_id, device_id, command_id, event, details, created_at)
+            SELECT id, owner_id, device_id, command_id, event, details, created_at
+            FROM agent_audit_log_phase6_legacy
+            """
+        )
+
+        connection.execute("DROP TABLE agent_audit_log_phase6_legacy")
+        connection.execute("DROP TABLE agent_approvals_phase6_legacy")
+        connection.execute("DROP TABLE agent_commands_phase6_legacy")
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_desktop_capabilities (
+                device_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+                capabilities TEXT NOT NULL DEFAULT '{}',
+                session_type TEXT NOT NULL DEFAULT 'unknown',
+                updated_at TEXT NOT NULL,
+                UNIQUE(device_id, owner_id),
+                FOREIGN KEY(device_id, owner_id)
+                    REFERENCES agent_devices(id, owner_id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_execution_sessions (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+                device_id TEXT NOT NULL,
+                command_id TEXT NOT NULL UNIQUE,
+                adapter TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'started', 'completed', 'failed', 'cancelled'
+                )),
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                FOREIGN KEY(command_id, owner_id)
+                    REFERENCES agent_commands(id, owner_id) ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX idx_agent_commands_owner ON agent_commands(owner_id, created_at)"
+        )
+        connection.execute(
+            "CREATE INDEX idx_agent_approvals_owner ON agent_approvals(owner_id, status, expires_at)"
+        )
+        connection.execute(
+            "CREATE INDEX idx_agent_audit_owner ON agent_audit_log(owner_id, created_at)"
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_agent_execution_owner
+            ON agent_execution_sessions(owner_id, started_at)
+            """
+        )
+
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError("Agent database migration found invalid ownership references")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
+
+
 def apply_migrations(connection):
     connection.execute(
         """
@@ -432,3 +598,7 @@ def apply_migrations(connection):
         with connection:
             _index_rate_event_expiry(connection)
             connection.execute("INSERT INTO schema_migrations (version) VALUES (5)")
+    if 6 not in versions:
+        with connection:
+            _expand_desktop_actions_and_add_registries(connection)
+            connection.execute("INSERT INTO schema_migrations (version) VALUES (6)")

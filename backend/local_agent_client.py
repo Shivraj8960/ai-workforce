@@ -53,7 +53,14 @@ def _rejection_result(command):
         or not command_id
         or len(command_id) > 64
         or not isinstance(action, str)
-        or action not in {"open_app", "capture_screen"}
+        or action not in {
+            "open_app",
+            "capture_screen",
+            "get_active_window",
+            "input_text",
+            "read_file",
+            "write_file",
+        }
     ):
         return None
     return {
@@ -64,7 +71,7 @@ def _rejection_result(command):
     }
 
 
-async def _run_connection(url, device_id, credential, seen_commands):
+async def _run_connection(url, device_id, credential, seen_commands, runtime=None):
     async with connect(
         url,
         open_timeout=10,
@@ -84,13 +91,22 @@ async def _run_connection(url, device_id, credential, seen_commands):
         if auth_response != {"type": "authenticated", "device_id": device_id}:
             raise AgentAuthenticationError("Backend rejected Local Agent authentication")
 
+        if runtime is not None:
+            capabilities = runtime.capabilities()
+            session_type = os.getenv("XDG_SESSION_TYPE", "unknown").strip().lower() or "unknown"
+            await websocket.send(json.dumps({
+                "type": "capabilities",
+                "capabilities": capabilities,
+                "session_type": session_type,
+            }, separators=(",", ":")))
+
         send_lock = asyncio.Lock()
         heartbeat = asyncio.create_task(_send_heartbeats(websocket, send_lock))
         try:
             async for raw_message in websocket:
                 message = parse_message(raw_message)
                 message_type = message.get("type")
-                if message_type in {"heartbeat_ack", "result_ack"}:
+                if message_type in {"heartbeat_ack", "result_ack", "capabilities_ack"}:
                     continue
                 if message_type != "command":
                     raise ValueError("Unexpected backend WebSocket message")
@@ -99,7 +115,7 @@ async def _run_connection(url, device_id, credential, seen_commands):
                 if isinstance(command_id, str) and command_id in seen_commands:
                     continue
                 try:
-                    result = handle_command(message)
+                    result = handle_command(message, runtime=runtime)
                 except ValueError:
                     result = _rejection_result(message)
                     if result is None:
@@ -118,15 +134,25 @@ async def _run_connection(url, device_id, credential, seen_commands):
                 await heartbeat
             except asyncio.CancelledError:
                 pass
+            if runtime is not None:
+                runtime.stop()
 
 
 async def run_agent(backend_url, device_id, credential, development=False):
     url = build_agent_url(backend_url, device_id, development=development)
     seen_commands = OrderedDict()
+    runtime = None
+    try:
+        from desktop_runtime import DesktopRuntime
+        runtime = DesktopRuntime()
+    except ImportError:
+        pass
     retry_delay = 1
     while True:
         try:
-            await _run_connection(url, device_id, credential, seen_commands)
+            if runtime is not None:
+                runtime.reset()
+            await _run_connection(url, device_id, credential, seen_commands, runtime=runtime)
             retry_delay = 1
         except ConnectionClosed as exc:
             if exc.code == 1008:

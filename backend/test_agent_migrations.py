@@ -180,6 +180,52 @@ class AgentMigrationTests(unittest.TestCase):
             0,
         )
 
+    def test_phase6_preserves_commands_and_adds_desktop_registries(self):
+        self.insert_device()
+        self.connection.execute(
+            """
+            INSERT INTO agent_commands
+            (id, owner_id, device_id, client_request_id, action, payload,
+             status, created_at, updated_at, deadline_at)
+            VALUES ('command-a', 'owner-a', 'device-a', 'request-a',
+                    'open_app', '{"app_id":"calculator"}', 'failed',
+                    '2025-01-01', '2025-01-01', '2025-01-02')
+            """
+        )
+        self.connection.commit()
+
+        apply_migrations(self.connection)
+
+        row = self.connection.execute(
+            "SELECT action, status FROM agent_commands WHERE id = 'command-a'"
+        ).fetchone()
+        self.assertEqual(row["action"], "open_app")
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM agent_desktop_capabilities"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM agent_execution_sessions"
+            ).fetchone()[0],
+            0,
+        )
+
+        self.connection.execute(
+            """
+            INSERT INTO agent_commands
+            (id, owner_id, device_id, client_request_id, action, payload,
+             status, created_at, updated_at, deadline_at)
+            VALUES ('command-b', 'owner-a', 'device-a', 'request-b',
+                    'get_active_window', '{}', 'pending_approval',
+                    '2025-01-01', '2025-01-01', '2025-01-02')
+            """
+        )
+        self.connection.commit()
+
 
 if __name__ == "__main__":
     unittest.main()
