@@ -1,10 +1,13 @@
 """Validation-only WebSocket client for a paired NEX Local Agent."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import functools
 import json
 import os
 from collections import OrderedDict
 from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
 from websockets.asyncio.client import connect
 from websockets.exceptions import (
@@ -38,6 +41,64 @@ def build_agent_url(backend_url, device_id, development=False):
     return urlunsplit((scheme, parsed.netloc, path, "", ""))
 
 
+def build_observation_url(backend_url, device_id, command_id, development=False):
+    parsed = urlsplit(backend_url)
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Backend URL is invalid")
+    if parsed.scheme in {"https", "wss"}:
+        scheme = "https"
+    elif development and parsed.scheme in {"http", "ws"}:
+        scheme = "http"
+    else:
+        raise ValueError("Local Agent requires a secure HTTPS backend URL")
+    path = (
+        parsed.path.rstrip("/")
+        + "/computer/agent/devices/"
+        + quote(device_id, safe="")
+        + "/commands/"
+        + quote(command_id, safe="")
+        + "/observation"
+    )
+    return urlunsplit((scheme, parsed.netloc, path, "", ""))
+
+
+def _upload_observation(
+    backend_url, device_id, command_id, credential, image_bytes, development,
+    active_window_identity=None,
+):
+    if (
+        not isinstance(image_bytes, bytes)
+        or not image_bytes
+        or len(image_bytes) > 5 * 1024 * 1024
+    ):
+        raise ValueError("Captured screenshot is invalid or too large")
+    request = Request(
+        build_observation_url(
+            backend_url, device_id, command_id, development=development
+        ),
+        data=image_bytes,
+        headers={
+            "Content-Type": "application/octet-stream",
+            "X-Device-Credential": credential,
+            **(
+                {"X-Active-Window-Identity": active_window_identity}
+                if isinstance(active_window_identity, str)
+                else {}
+            ),
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=25) as response:
+        body = response.read(8193)
+        if response.status != 201 or len(body) > 8192:
+            raise RuntimeError("Backend rejected the screen observation")
+    result = parse_message(body.decode("utf-8"))
+    observation_id = result.get("observation_id")
+    if result.get("status") != "created" or not isinstance(observation_id, str):
+        raise RuntimeError("Backend returned an invalid observation response")
+    return observation_id
+
+
 async def _send_heartbeats(websocket, send_lock):
     while True:
         await asyncio.sleep(HEARTBEAT_SECONDS)
@@ -60,6 +121,14 @@ def _rejection_result(command):
             "input_text",
             "read_file",
             "write_file",
+            "click",
+            "browser_navigate",
+            "browser_read_page",
+            "browser_inspect_controls",
+            "browser_fill",
+            "browser_submit",
+            "browser_download",
+            "browser_close",
         }
     ):
         return None
@@ -71,7 +140,15 @@ def _rejection_result(command):
     }
 
 
-async def _run_connection(url, device_id, credential, seen_commands, runtime=None):
+async def _run_connection(
+    url,
+    device_id,
+    credential,
+    seen_commands,
+    runtime=None,
+    backend_url=None,
+    development=False,
+):
     async with connect(
         url,
         open_timeout=10,
@@ -101,6 +178,7 @@ async def _run_connection(url, device_id, credential, seen_commands, runtime=Non
             }, separators=(",", ":")))
 
         send_lock = asyncio.Lock()
+        command_executor = ThreadPoolExecutor(max_workers=1)
         heartbeat = asyncio.create_task(_send_heartbeats(websocket, send_lock))
         try:
             async for raw_message in websocket:
@@ -115,11 +193,39 @@ async def _run_connection(url, device_id, credential, seen_commands, runtime=Non
                 if isinstance(command_id, str) and command_id in seen_commands:
                     continue
                 try:
-                    result = handle_command(message, runtime=runtime)
+                    result = await asyncio.get_running_loop().run_in_executor(
+                        command_executor,
+                        functools.partial(handle_command, message, runtime=runtime),
+                    )
                 except ValueError:
                     result = _rejection_result(message)
                     if result is None:
                         raise
+                image_bytes = result.pop("image_bytes", None)
+                active_window_identity = result.pop("active_window_identity", None)
+                if image_bytes is not None:
+                    try:
+                        observation_id = await asyncio.get_running_loop().run_in_executor(
+                            command_executor,
+                            functools.partial(
+                                _upload_observation,
+                                backend_url
+                                or url.rsplit("/computer/agent/ws/", 1)[0],
+                                device_id,
+                                command_id,
+                                credential,
+                                image_bytes,
+                                development,
+                                active_window_identity,
+                            ),
+                        )
+                    except (OSError, RuntimeError, ValueError):
+                        result["success"] = False
+                        result["message"] = (
+                            "Screenshot analysis failed; no observation was stored"
+                        )
+                    else:
+                        result["observation_id"] = observation_id
                 if isinstance(command_id, str) and command_id:
                     seen_commands[command_id] = None
                     seen_commands.move_to_end(command_id)
@@ -127,7 +233,10 @@ async def _run_connection(url, device_id, credential, seen_commands, runtime=Non
                         seen_commands.popitem(last=False)
 
                 async with send_lock:
-                    await websocket.send(json.dumps(result, separators=(",", ":")))
+                    encoded_result = json.dumps(result, separators=(",", ":"))
+                    if len(encoded_result.encode("utf-8")) > MAX_MESSAGE_BYTES:
+                        raise ValueError("Local Agent result exceeds the protocol safety limit")
+                    await websocket.send(encoded_result)
         finally:
             heartbeat.cancel()
             try:
@@ -135,7 +244,10 @@ async def _run_connection(url, device_id, credential, seen_commands, runtime=Non
             except asyncio.CancelledError:
                 pass
             if runtime is not None:
-                runtime.stop()
+                await asyncio.get_running_loop().run_in_executor(
+                    command_executor, runtime.stop
+                )
+            command_executor.shutdown(wait=True, cancel_futures=True)
 
 
 async def run_agent(backend_url, device_id, credential, development=False):
@@ -152,7 +264,15 @@ async def run_agent(backend_url, device_id, credential, development=False):
         try:
             if runtime is not None:
                 runtime.reset()
-            await _run_connection(url, device_id, credential, seen_commands, runtime=runtime)
+            await _run_connection(
+                url,
+                device_id,
+                credential,
+                seen_commands,
+                runtime=runtime,
+                backend_url=backend_url,
+                development=development,
+            )
             retry_delay = 1
         except ConnectionClosed as exc:
             if exc.code == 1008:
