@@ -131,6 +131,9 @@ Check the service configuration and executable paths before restarting. Do not e
 
 ## Local Agent command workflow
 
+Phase 4 computer-vision and browser setup, API examples, configuration, and
+security limits are documented in [`COMPUTER_USE.md`](../COMPUTER_USE.md).
+
 The customer API is rooted at `/computer/agent`. Every HTTP request requires both the server `X-API-Key` and the customer's `Authorization: Bearer <access-token>`. The global API key is not a Local Agent credential. Customer ownership is checked server-side for every device, approval, command, and history lookup. Invalid or expired credentials return `401`; missing/foreign resources return `404`; invalid actions return `422`; unavailable devices return `409`; active emergency stop returns `423`; and rate limits return `429`.
 
 ### Pairing, requests, and decisions

@@ -7,6 +7,16 @@ from migrations import apply_migrations, payload_hash
 from local_agent_protocol import ALLOWED_ACTIONS as LOCAL_AGENT_ALLOWED_ACTIONS
 from local_agent_protocol import MAX_MESSAGE_BYTES, parse_message, validate_command
 from desktop_runtime import desktop_execution_enabled
+from browser_runtime import browser_automation_enabled
+from browser_security import configured_browser_domains, validate_browser_url
+from vision_engine import MAX_SCREENSHOT_BYTES, VisionEngine
+from computer_planner import (
+    MIN_ACTION_CONFIDENCE,
+    OPERATION_ACTIONS,
+    SOURCE_OPERATIONS,
+    build_action_proposal,
+    parse_agent_candidate,
+)
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -18,11 +28,12 @@ import asyncio
 import hashlib
 import hmac
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, StrictBool, StrictStr, ValidationError
+from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr, ValidationError
 from typing import Optional, List, Dict, Any, Literal
 import sqlite3
 import uuid
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 
@@ -45,20 +56,28 @@ app.add_middleware(
 async def api_key_auth(request: Request, call_next):
     if request.method == "OPTIONS" or request.url.path in {"/health", "/auth/register", "/auth/login"}:
         return await call_next(request)
+    device_observation_upload = (
+        request.method == "POST"
+        and re.fullmatch(
+            r"/computer/agent/devices/[^/]+/commands/[^/]+/observation",
+            request.url.path,
+        )
+    )
 
     mode = os.getenv("NEX_ENV", "production").strip().lower()
+    if mode not in {"development", "production"}:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Invalid server environment configuration"},
+        )
+    if device_observation_upload:
+        return await call_next(request)
 
     if mode == "development":
         limited = _agent_http_rate_limit_response(request)
         if limited is not None:
             return limited
         return await call_next(request)
-
-    if mode != "production":
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "Invalid server environment configuration"},
-        )
 
     api_key = os.getenv("NEX_API_KEY", "")
     if len(api_key.encode("utf-8")) < 32:
@@ -316,8 +335,13 @@ init_db()
 
 
 DESKTOP_EXECUTION_ENABLED = desktop_execution_enabled()
+BROWSER_AUTOMATION_ENABLED = browser_automation_enabled()
 AGENT_COMMAND_TIMEOUT_SECONDS = 15
+AGENT_BROWSER_TIMEOUT_SECONDS = 25
+AGENT_SCREEN_ANALYSIS_TIMEOUT_SECONDS = 35
 AGENT_APPROVAL_TTL_SECONDS = 300
+OBSERVATION_TTL_SECONDS = 900
+ACTION_PROPOSAL_TTL_SECONDS = 300
 AGENT_REQUESTS_PER_MINUTE = 20
 AGENT_PAIRINGS_PER_HOUR = 5
 AGENT_APPROVAL_ATTEMPTS_PER_MINUTE = 10
@@ -363,7 +387,7 @@ class CustomerLogin(BaseModel):
 
 class AgentDeviceCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
-    permissions: List[str] = Field(default_factory=list, max_length=6)
+    permissions: List[str] = Field(default_factory=list, max_length=14)
 
     class Config:
         extra = "forbid"
@@ -377,9 +401,59 @@ class AgentCommandRequest(BaseModel):
         "input_text",
         "read_file",
         "write_file",
+        "click",
+        "browser_navigate",
+        "browser_read_page",
+        "browser_inspect_controls",
+        "browser_fill",
+        "browser_submit",
+        "browser_download",
+        "browser_close",
     ]
     payload: Dict[str, Any] = Field(default_factory=dict)
     client_request_id: str = Field(min_length=16, max_length=128)
+    proposal_id: Optional[StrictStr] = Field(default=None, min_length=36, max_length=36)
+
+    class Config:
+        extra = "forbid"
+
+
+class ComputerActionProposalRequest(BaseModel):
+    instruction: StrictStr = Field(min_length=1, max_length=1000)
+    operation: Literal[
+        "desktop.click",
+        "browser.navigate",
+        "browser.read_page",
+        "browser.inspect_controls",
+        "browser.fill",
+        "browser.submit",
+        "browser.download",
+        "browser.close",
+    ]
+    observation_id: Optional[StrictStr] = Field(default=None, max_length=64)
+    browser_session_id: Optional[StrictStr] = Field(default=None, max_length=64)
+    target_element_id: Optional[StrictStr] = Field(default=None, max_length=64)
+    url: Optional[StrictStr] = Field(default=None, max_length=2048)
+    text: Optional[StrictStr] = Field(default=None, max_length=2000)
+    expected_result: Optional[Dict[str, Any]] = None
+
+    class Config:
+        extra = "forbid"
+
+
+class ComputerActionDraftRequest(BaseModel):
+    instruction: StrictStr = Field(min_length=1, max_length=1000)
+    observation_id: StrictStr = Field(min_length=36, max_length=64)
+    browser_session_id: Optional[StrictStr] = Field(default=None, max_length=64)
+    text: Optional[StrictStr] = Field(default=None, max_length=2000)
+    expected_result: Optional[Dict[str, Any]] = None
+
+    class Config:
+        extra = "forbid"
+
+
+class ComputerActionVerificationRequest(BaseModel):
+    observation_id: StrictStr = Field(min_length=36, max_length=64)
 
     class Config:
         extra = "forbid"
@@ -401,9 +475,26 @@ class AgentCommandResult(BaseModel):
         "input_text",
         "read_file",
         "write_file",
+        "click",
+        "browser_navigate",
+        "browser_read_page",
+        "browser_inspect_controls",
+        "browser_fill",
+        "browser_submit",
+        "browser_download",
+        "browser_close",
     ]
     success: StrictBool
     message: StrictStr = Field(min_length=1, max_length=500)
+    session_id: Optional[StrictStr] = Field(default=None, max_length=64)
+    observation_id: Optional[StrictStr] = Field(default=None, max_length=64)
+    data: Optional[Dict[str, Any]] = None
+    observation: Optional[Dict[str, Any]] = None
+    page_identity: Optional[StrictStr] = Field(default=None, min_length=36, max_length=36)
+    navigation_generation: Optional[StrictInt] = Field(default=None, ge=1)
+    session_closed: Optional[StrictBool] = None
+    failure_code: Optional[Literal["desktop_click_stale"]] = None
+    verification_status: Optional[Literal["verified", "observed", "unverified"]] = None
 
     class Config:
         extra = "forbid"
@@ -533,6 +624,11 @@ def login_customer(request: CustomerLogin):
 
 employees_db = [
     Employee(
+        name="Planner",
+        role="Planning AI",
+        goal="Break customer goals into bounded tasks and dependencies"
+    ),
+    Employee(
         name="Researcher",
         role="Research AI",
         goal="Find and organize useful information"
@@ -556,6 +652,11 @@ employees_db = [
         name="Executor",
         role="Execution AI",
         goal="Execute approved actions"
+    ),
+    Employee(
+        name="Computer Agent",
+        role="Approved Computer Use AI",
+        goal="Propose computer actions from observations without bypassing approval"
     ),
     Employee(
         name="Reviewer",
@@ -1713,38 +1814,193 @@ def _agent_safety_stopped(connection, owner_id):
 def _validate_agent_action(action, payload):
     if action not in ALLOWED_AGENT_ACTIONS or not isinstance(payload, dict):
         raise HTTPException(status_code=422, detail="Action or payload is invalid")
+    try:
+        validate_command(
+            {
+                "type": "command",
+                "command_id": "validation-command",
+                "action": action,
+                "payload": payload,
+                "execution_enabled": True,
+            }
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    if action == "open_app":
+
+def _action_execution_enabled(action):
+    return BROWSER_AUTOMATION_ENABLED if action.startswith("browser_") else DESKTOP_EXECUTION_ENABLED
+
+
+def _cleanup_expired_computer_data(connection, owner_id):
+    now = _utc_text()
+    connection.execute(
+        """
+        UPDATE computer_action_proposals
+        SET status = CASE
+                WHEN status IN ('proposed', 'pending_approval') THEN 'expired'
+                ELSE status
+            END,
+            observation_id = NULL,
+            browser_session_id = NULL,
+            target_element_id = NULL,
+            payload = '{}',
+            expected_result = '{}',
+            verification_status = CASE
+                WHEN verification_status = 'pending' THEN 'failed'
+                ELSE verification_status
+            END,
+            updated_at = ?
+        WHERE owner_id = ? AND expires_at <= ?
+        """,
+        (now, owner_id, now),
+    )
+    connection.execute(
+        "DELETE FROM computer_observations WHERE owner_id = ? AND expires_at <= ?",
+        (owner_id, now),
+    )
+    connection.execute(
+        """
+        UPDATE browser_sessions SET status = 'expired', initial_url = NULL
+        WHERE owner_id = ? AND expires_at <= ? AND status != 'closed'
+        """,
+        (owner_id, now),
+    )
+
+
+def _store_observation(
+    connection,
+    owner_id,
+    device_id,
+    source,
+    width,
+    height,
+    provider,
+    elements,
+    command_id=None,
+    image_sha256=None,
+    observation_id=None,
+    browser_session_id=None,
+    page_identity=None,
+    navigation_generation=None,
+    active_window_identity=None,
+):
+    observation_id = observation_id or str(uuid.uuid4())
+    captured_at = _utc_text()
+    expires_at = _utc_text(_utc_now() + timedelta(seconds=OBSERVATION_TTL_SECONDS))
+    connection.execute(
+        """
+        INSERT INTO computer_observations
+        (id, owner_id, device_id, source, command_id, browser_session_id,
+         page_identity, navigation_generation, screen_width, screen_height,
+         provider, image_sha256, active_window_identity, elements, captured_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            observation_id,
+            owner_id,
+            device_id,
+            source,
+            command_id,
+            browser_session_id,
+            page_identity,
+            navigation_generation,
+            width,
+            height,
+            provider,
+            image_sha256,
+            active_window_identity,
+            json.dumps(elements, separators=(",", ":"), sort_keys=True),
+            captured_at,
+            expires_at,
+        ),
+    )
+    return {
+        "observation_id": observation_id,
+        "device_id": device_id,
+        "source": source,
+        "browser_session_id": browser_session_id,
+        "page_identity": page_identity,
+        "navigation_generation": navigation_generation,
+        "screen_dimensions": {"width": width, "height": height},
+        "image_sha256": image_sha256,
+        "active_window_identity": active_window_identity,
+        "elements": elements,
+        "timestamp": captured_at,
+        "expires_at": expires_at,
+    }
+
+
+def _validate_dom_observation(observation):
+    if not isinstance(observation, dict) or set(observation) != {
+        "source", "screen_width", "screen_height", "elements",
+        "browser_session_id", "page_identity", "navigation_generation",
+    }:
+        raise ValueError("Browser observation schema is invalid")
+    width = observation["screen_width"]
+    height = observation["screen_height"]
+    elements = observation["elements"]
+    if (
+        observation["source"] != "browser_dom"
+        or isinstance(width, bool)
+        or not isinstance(width, int)
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or not 1 <= width <= 4096
+        or not 1 <= height <= 4096
+        or not isinstance(elements, list)
+        or len(elements) > 20
+        or not isinstance(observation["browser_session_id"], str)
+        or not re.fullmatch(r"[a-f0-9-]{36}", observation["browser_session_id"])
+        or not isinstance(observation["page_identity"], str)
+        or not re.fullmatch(r"[a-f0-9-]{36}", observation["page_identity"])
+        or isinstance(observation["navigation_generation"], bool)
+        or not isinstance(observation["navigation_generation"], int)
+        or observation["navigation_generation"] < 1
+    ):
+        raise ValueError("Browser observation bounds are invalid")
+    required = {
+        "element_id", "type", "description", "bounding_box",
+        "confidence", "ambiguous", "control",
+    }
+    for element in elements:
         if (
-            set(payload) != {"app_id"}
-            or not isinstance(payload.get("app_id"), str)
-            or payload["app_id"] not in AGENT_APP_ALLOWLIST
+            not isinstance(element, dict)
+            or set(element) != required
+            or not isinstance(element["element_id"], str)
+            or not isinstance(element["description"], str)
+            or len(element["description"]) > 200
+            or element["type"] not in {"button", "link", "text_field"}
+            or element["confidence"] != 1.0
+            or element["ambiguous"] is not False
+            or not isinstance(element["control"], dict)
         ):
-            raise HTTPException(status_code=422, detail="Application is not allowlisted")
-    elif action in {"capture_screen", "get_active_window"}:
-        if payload:
-            raise HTTPException(status_code=422, detail="Action does not accept a payload")
-    elif action == "input_text":
+            raise ValueError("Browser observation contains an invalid control")
+        box = element["bounding_box"]
         if (
-            set(payload) != {"text"}
-            or not isinstance(payload.get("text"), str)
-            or not 1 <= len(payload["text"]) <= 500
+            not isinstance(box, dict)
+            or set(box) != {"x", "y", "width", "height"}
+            or any(
+                isinstance(box.get(key), bool)
+                or not isinstance(box.get(key), (int, float))
+                for key in ("x", "y", "width", "height")
+            )
+            or box["x"] < 0
+            or box["y"] < 0
+            or box["width"] <= 0
+            or box["height"] <= 0
+            or box["x"] + box["width"] > width
+            or box["y"] + box["height"] > height
         ):
-            raise HTTPException(status_code=422, detail="Input text is outside the safety limit")
-    elif action in {"read_file", "write_file"}:
-        expected = {"path"} if action == "read_file" else {"path", "content"}
-        if set(payload) != expected:
-            raise HTTPException(status_code=422, detail="Restricted file payload is invalid")
-        if (
-            not isinstance(payload.get("path"), str)
-            or not payload["path"]
-            or len(payload["path"]) > 1024
-        ):
-            raise HTTPException(status_code=422, detail="Restricted file path is invalid")
-        if action == "write_file":
-            content = payload.get("content")
-            if not isinstance(content, str) or len(content.encode("utf-8")) > 65536:
-                raise HTTPException(status_code=422, detail="Restricted file content is too large")
+            raise ValueError("Browser observation contains out-of-bounds geometry")
+    return (
+        width,
+        height,
+        elements,
+        observation["browser_session_id"],
+        observation["page_identity"],
+        observation["navigation_generation"],
+    )
 
 
 def _expire_agent_approvals(connection, owner_id):
@@ -1769,6 +2025,16 @@ def _expire_agent_approvals(connection, owner_id):
             UPDATE agent_commands
             SET status = 'expired', updated_at = ?
             WHERE id = ? AND status = 'pending_approval'
+            """,
+            [(now, row["command_id"]) for row in expired],
+        )
+        connection.executemany(
+            """
+            UPDATE computer_action_proposals
+            SET status = 'expired', updated_at = ?
+            WHERE id = (
+                SELECT proposal_id FROM agent_commands WHERE id = ?
+            ) AND status = 'pending_approval'
             """,
             [(now, row["command_id"]) for row in expired],
         )
@@ -1903,6 +2169,7 @@ async def _revoke_agent_device_locked(device_id, customer):
     connection = get_db()
     try:
         connection.execute("BEGIN IMMEDIATE")
+        _cleanup_expired_computer_data(connection, customer["id"])
         device = connection.execute(
             "SELECT id FROM agent_devices WHERE id = ? AND owner_id = ?",
             (device_id, customer["id"]),
@@ -2145,6 +2412,729 @@ def reset_emergency_stop(customer: dict = Depends(get_current_customer)):
     return {"status": "active", "message": "Emergency stop reset; devices must reconnect"}
 
 
+@app.post("/computer/agent/devices/{device_id}/proposals", status_code=201)
+def create_computer_action_proposal(
+    device_id: str,
+    request: ComputerActionProposalRequest,
+    customer: dict = Depends(get_current_customer),
+):
+    action, permission, observation_source, _element_type = OPERATION_ACTIONS[request.operation]
+    if action.startswith("browser_") and not BROWSER_AUTOMATION_ENABLED:
+        raise HTTPException(status_code=409, detail="Browser automation is disabled")
+    if action == "click" and not DESKTOP_EXECUTION_ENABLED:
+        raise HTTPException(status_code=409, detail="Desktop execution is disabled")
+
+    supplied_fields = {
+        key
+        for key, value in (
+            request.model_dump() if hasattr(request, "model_dump") else request.dict()
+        ).items()
+        if key not in {"operation", "instruction"} and value is not None
+    }
+    allowed_fields = {
+        "desktop.click": {
+            "observation_id", "target_element_id", "expected_result"
+        },
+        "browser.navigate": {"browser_session_id", "url"},
+        "browser.read_page": {"browser_session_id"},
+        "browser.inspect_controls": {"browser_session_id"},
+        "browser.fill": {
+            "observation_id", "browser_session_id", "target_element_id", "text"
+        },
+        "browser.submit": {
+            "observation_id", "browser_session_id", "target_element_id", "expected_result"
+        },
+        "browser.download": {
+            "observation_id", "browser_session_id", "target_element_id"
+        },
+        "browser.close": {"browser_session_id"},
+    }[request.operation]
+    if supplied_fields - allowed_fields:
+        raise HTTPException(status_code=422, detail="Proposal contains unrelated fields")
+
+    connection = get_db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _cleanup_expired_computer_data(connection, customer["id"])
+        device = connection.execute(
+            "SELECT permissions FROM agent_devices WHERE id = ? AND owner_id = ?",
+            (device_id, customer["id"]),
+        ).fetchone()
+        if device is None:
+            raise HTTPException(status_code=404, detail="Device not found")
+        if permission not in json.loads(device["permissions"]):
+            raise HTTPException(status_code=403, detail="Device does not permit this action")
+        if action == "click" and "capture_screen" not in json.loads(device["permissions"]):
+            raise HTTPException(
+                status_code=403,
+                detail="Fresh click verification requires screen-capture permission",
+            )
+        if _agent_safety_stopped(connection, customer["id"]):
+            raise HTTPException(status_code=423, detail="Emergency stop is active")
+
+        observation_data = None
+        observation_row = None
+        if observation_source is not None:
+            if not request.observation_id or not request.target_element_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail="A fresh observation and target element are required",
+                )
+            observation_row = connection.execute(
+                """
+                SELECT id, source, screen_width, screen_height, elements, expires_at,
+                       browser_session_id, page_identity, navigation_generation,
+                       image_sha256, active_window_identity, captured_at
+                FROM computer_observations
+                WHERE id = ? AND owner_id = ? AND device_id = ?
+                """,
+                (request.observation_id, customer["id"], device_id),
+            ).fetchone()
+            if observation_row is None or observation_row["expires_at"] <= _utc_text():
+                raise HTTPException(status_code=409, detail="Observation is missing or expired")
+            observation_data = {
+                "observation_id": observation_row["id"],
+                "device_id": device_id,
+                "source": observation_row["source"],
+                "browser_session_id": observation_row["browser_session_id"],
+                "page_identity": observation_row["page_identity"],
+                "navigation_generation": observation_row["navigation_generation"],
+                "image_sha256": observation_row["image_sha256"],
+                "active_window_identity": observation_row["active_window_identity"],
+                "timestamp": observation_row["captured_at"],
+                "expires_at": observation_row["expires_at"],
+                "screen_dimensions": {
+                    "width": observation_row["screen_width"],
+                    "height": observation_row["screen_height"],
+                },
+                "elements": json.loads(observation_row["elements"]),
+            }
+
+        session_id = request.browser_session_id
+        normalized_url = request.url
+        if request.operation == "browser.navigate":
+            if not request.url:
+                raise HTTPException(status_code=422, detail="An approved destination URL is required")
+            try:
+                normalized_url, _addresses = validate_browser_url(
+                    request.url, configured_browser_domains()
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if session_id is None:
+                session_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO browser_sessions
+                    (id, owner_id, device_id, initial_url, status, created_at, expires_at)
+                    VALUES (?, ?, ?, ?, 'planned', ?, ?)
+                    """,
+                    (
+                        session_id,
+                        customer["id"],
+                        device_id,
+                        None,
+                        _utc_text(),
+                        _utc_text(_utc_now() + timedelta(seconds=OBSERVATION_TTL_SECONDS)),
+                    ),
+                )
+            else:
+                session = connection.execute(
+                    """
+                    SELECT id, status, expires_at, page_identity, navigation_generation
+                    FROM browser_sessions
+                    WHERE id = ? AND owner_id = ? AND device_id = ?
+                    """,
+                    (session_id, customer["id"], device_id),
+                ).fetchone()
+                if (
+                    session is None
+                    or session["expires_at"] <= _utc_text()
+                    or session["status"] not in {"planned", "active"}
+                ):
+                    raise HTTPException(status_code=409, detail="Browser session is unavailable")
+        elif action.startswith("browser_"):
+            if not session_id:
+                raise HTTPException(status_code=422, detail="Browser session ID is required")
+            session = connection.execute(
+                """
+                SELECT id, status, expires_at, page_identity, navigation_generation
+                FROM browser_sessions
+                WHERE id = ? AND owner_id = ? AND device_id = ?
+                """,
+                (session_id, customer["id"], device_id),
+            ).fetchone()
+            if (
+                session is None
+                or session["expires_at"] <= _utc_text()
+                or session["status"] not in {"planned", "active"}
+            ):
+                raise HTTPException(status_code=409, detail="Browser session is unavailable")
+            if request.operation in {
+                "browser.fill", "browser.submit", "browser.download"
+            } and (
+                observation_row is None
+                or observation_row["browser_session_id"] != session_id
+                or observation_row["page_identity"] != session["page_identity"]
+                or observation_row["navigation_generation"]
+                != session["navigation_generation"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Browser observation is stale or belongs to another page",
+                )
+
+        if request.operation == "desktop.click":
+            expectation = request.expected_result
+            if (
+                not isinstance(expectation, dict)
+                or set(expectation) != {"kind", "text"}
+                or expectation.get("kind") != "element_visible"
+                or not isinstance(expectation.get("text"), str)
+                or not 1 <= len(expectation["text"]) <= 200
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Desktop click requires an expected visible result",
+                )
+
+        if request.operation == "browser.submit":
+            expectation = request.expected_result
+            if not isinstance(expectation, dict):
+                raise HTTPException(status_code=422, detail="Expected result is required")
+            if expectation.get("kind") == "url":
+                if set(expectation) != {"kind", "url"} or not isinstance(expectation.get("url"), str):
+                    raise HTTPException(status_code=422, detail="Expected result is invalid")
+                try:
+                    validate_browser_url(
+                        expectation["url"], configured_browser_domains()
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+            elif (
+                expectation.get("kind") != "visible_text"
+                or set(expectation) != {"kind", "text"}
+                or not isinstance(expectation.get("text"), str)
+                or not 1 <= len(expectation["text"]) <= 500
+            ):
+                raise HTTPException(status_code=422, detail="Expected result is invalid")
+
+        try:
+            action, permission, confidence, payload = build_action_proposal(
+                request.operation,
+                instruction=request.instruction,
+                observation=observation_data,
+                target_element_id=request.target_element_id,
+                session_id=session_id,
+                url=normalized_url,
+                text=request.text,
+                expected_result=request.expected_result,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        proposal_id = str(uuid.uuid4())
+        payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        now = _utc_text()
+        expires_at = _utc_text(_utc_now() + timedelta(seconds=ACTION_PROPOSAL_TTL_SECONDS))
+        digest = payload_hash(
+            action,
+            payload_json,
+            device_id,
+            proposal_id=proposal_id,
+            instruction=request.instruction,
+        )
+        connection.execute(
+            """
+            INSERT INTO computer_action_proposals
+            (id, owner_id, device_id, observation_id, browser_session_id, action,
+             instruction, target_element_id, permission, confidence, payload, payload_hash,
+             expected_result, status, expires_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?)
+            """,
+            (
+                proposal_id,
+                customer["id"],
+                device_id,
+                observation_row["id"] if observation_row is not None else None,
+                session_id if action.startswith("browser_") else None,
+                action,
+                request.instruction.strip(),
+                request.target_element_id,
+                permission,
+                confidence,
+                payload_json,
+                digest,
+                json.dumps(request.expected_result or {}, separators=(",", ":"), sort_keys=True),
+                expires_at,
+                now,
+                now,
+            ),
+        )
+        _agent_audit(
+            connection,
+            customer["id"],
+            "computer_action_proposed",
+            device_id=device_id,
+            details={"action": action, "proposal_id": proposal_id},
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    return {
+        "action_id": proposal_id,
+        "action": action,
+        "instruction": request.instruction.strip(),
+        "payload": payload,
+        "required_permission": permission,
+        "confidence": confidence,
+        "expected_result": request.expected_result,
+        "expires_at": expires_at,
+        "status": "proposed",
+        "browser_session_id": session_id if action.startswith("browser_") else None,
+    }
+
+
+@app.post("/computer/agent/devices/{device_id}/proposal-drafts", status_code=201)
+def draft_computer_action_proposal(
+    device_id: str,
+    request: ComputerActionDraftRequest,
+    customer: dict = Depends(get_current_customer),
+):
+    if os.getenv("NEX_COMPUTER_AGENT_PLANNING_ENABLED", "").strip().lower() != "true":
+        raise HTTPException(status_code=409, detail="Computer Agent planning is disabled")
+    connection = get_db()
+    try:
+        device = connection.execute(
+            """
+            SELECT permissions FROM agent_devices
+            WHERE id = ? AND owner_id = ? AND status = 'connected'
+            """,
+            (device_id, customer["id"]),
+        ).fetchone()
+        if device is None:
+            raise HTTPException(status_code=404, detail="Device not found")
+        if _agent_safety_stopped(connection, customer["id"]):
+            raise HTTPException(status_code=423, detail="Emergency stop is active")
+        observation = connection.execute(
+            """
+            SELECT id, source, screen_width, screen_height, elements
+            FROM computer_observations
+            WHERE id = ? AND owner_id = ? AND device_id = ? AND expires_at > ?
+            """,
+            (
+                request.observation_id,
+                customer["id"],
+                device_id,
+                _utc_text(),
+            ),
+        ).fetchone()
+    finally:
+        connection.close()
+    if observation is None:
+        raise HTTPException(status_code=404, detail="Observation not found")
+
+    permitted = set(json.loads(device["permissions"]))
+    allowed_operations = SOURCE_OPERATIONS.get(observation["source"], set()) & {
+        operation
+        for operation, (_action, permission, _source, _element_type) in OPERATION_ACTIONS.items()
+        if permission in permitted
+    }
+    if not DESKTOP_EXECUTION_ENABLED:
+        allowed_operations.discard("desktop.click")
+    if not BROWSER_AUTOMATION_ENABLED or not request.browser_session_id:
+        allowed_operations.difference_update(
+            {"browser.fill", "browser.submit", "browser.download"}
+        )
+    if request.text is None:
+        allowed_operations.discard("browser.fill")
+    if request.expected_result is None:
+        allowed_operations.difference_update({"desktop.click", "browser.submit"})
+    if not allowed_operations:
+        raise HTTPException(
+            status_code=403,
+            detail="No permitted computer action matches this observation",
+        )
+
+    elements = json.loads(observation["elements"])
+    context = {
+        "source": observation["source"],
+        "screen_dimensions": {
+            "width": observation["screen_width"],
+            "height": observation["screen_height"],
+        },
+        "allowed_operations": sorted(allowed_operations),
+        "elements": [
+            {
+                "element_id": element["element_id"],
+                "type": element["type"],
+                "description": element["description"],
+                "confidence": element["confidence"],
+                "ambiguous": element["ambiguous"],
+            }
+            for element in elements
+        ],
+    }
+    result = execute_agent(
+        "computer_agent",
+        "Select one observed computer action proposal",
+        request.instruction,
+        json.dumps(context, separators=(",", ":"), sort_keys=True),
+    )
+    if result.get("status") != "completed":
+        raise HTTPException(status_code=503, detail="Computer Agent planning failed")
+    raw_candidate = result.get("result")
+    if not isinstance(raw_candidate, str):
+        raise HTTPException(status_code=503, detail="Computer Agent planning failed")
+    try:
+        candidate = parse_agent_candidate(
+            extract_handoff_context(raw_candidate),
+            allowed_operations,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not candidate["target_element_id"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Computer Agent could not select an unambiguous target",
+                "rationale": candidate["rationale"],
+            },
+        )
+
+    proposal_request = ComputerActionProposalRequest(
+        instruction=request.instruction,
+        operation=candidate["operation"],
+        observation_id=request.observation_id,
+        browser_session_id=request.browser_session_id,
+        target_element_id=candidate["target_element_id"],
+        text=request.text,
+        expected_result=request.expected_result,
+    )
+    proposal = create_computer_action_proposal(
+        device_id,
+        proposal_request,
+        customer,
+    )
+    return {**proposal, "planner_rationale": candidate["rationale"]}
+
+
+@app.get("/computer/agent/observations/{observation_id}")
+def get_computer_observation(
+    observation_id: str,
+    customer: dict = Depends(get_current_customer),
+):
+    connection = get_db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _cleanup_expired_computer_data(connection, customer["id"])
+        row = connection.execute(
+            """
+            SELECT id AS observation_id, device_id, source, screen_width,
+                   screen_height, provider, elements, browser_session_id,
+                   page_identity, navigation_generation, captured_at, expires_at
+            FROM computer_observations
+            WHERE id = ? AND owner_id = ? AND expires_at > ?
+            """,
+            (observation_id, customer["id"], _utc_text()),
+        ).fetchone()
+        connection.commit()
+    finally:
+        connection.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Observation not found")
+    return {
+        **dict(row),
+        "screen_dimensions": {"width": row["screen_width"], "height": row["screen_height"]},
+        "elements": json.loads(row["elements"]),
+    }
+
+
+@app.get("/computer/agent/proposals/{proposal_id}")
+def get_computer_action_proposal(
+    proposal_id: str,
+    customer: dict = Depends(get_current_customer),
+):
+    connection = get_db()
+    try:
+        row = connection.execute(
+            """
+            SELECT id AS action_id, device_id, observation_id, browser_session_id,
+                   action, instruction, target_element_id, permission AS required_permission,
+                   confidence, payload, expected_result, verification_status,
+                   status, expires_at, created_at
+            FROM computer_action_proposals
+            WHERE id = ? AND owner_id = ?
+            """,
+            (proposal_id, customer["id"]),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Action proposal not found")
+    return {
+        **dict(row),
+        "payload": json.loads(row["payload"]),
+        "expected_result": json.loads(row["expected_result"]),
+    }
+
+
+@app.post("/computer/agent/proposals/{proposal_id}/verify")
+def verify_computer_action(
+    proposal_id: str,
+    request: ComputerActionVerificationRequest,
+    customer: dict = Depends(get_current_customer),
+):
+    connection = get_db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        proposal = connection.execute(
+            """
+            SELECT p.owner_id, p.device_id, p.action, p.expected_result,
+                   p.verification_status, c.id AS command_id, c.status AS command_status,
+                   c.updated_at AS command_updated_at, c.result,
+                   o.source, o.elements, o.captured_at
+            FROM computer_action_proposals p
+            JOIN agent_commands c ON c.proposal_id = p.id AND c.owner_id = p.owner_id
+            JOIN computer_observations o
+              ON o.id = ? AND o.owner_id = p.owner_id AND o.device_id = p.device_id
+            WHERE p.id = ? AND p.owner_id = ? AND o.expires_at > ?
+            """,
+            (request.observation_id, proposal_id, customer["id"], _utc_text()),
+        ).fetchone()
+        if (
+            proposal is None
+            or proposal["action"] != "click"
+            or proposal["command_status"] != "completed"
+            or proposal["verification_status"] != "pending"
+            or proposal["source"] != "screen"
+            or proposal["captured_at"] <= proposal["command_updated_at"]
+        ):
+            connection.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="A later authorized screen observation is required",
+            )
+        expected = json.loads(proposal["expected_result"])
+        if (
+            not isinstance(expected, dict)
+            or expected.get("kind") != "element_visible"
+            or not isinstance(expected.get("text"), str)
+        ):
+            connection.rollback()
+            raise HTTPException(status_code=409, detail="Proposal has no verifiable expected result")
+        matched = any(
+            isinstance(element, dict)
+            and isinstance(element.get("description"), str)
+            and expected["text"].casefold() in element["description"].casefold()
+            and isinstance(element.get("confidence"), (int, float))
+            and not isinstance(element.get("confidence"), bool)
+            and element["confidence"] >= MIN_ACTION_CONFIDENCE
+            and element.get("ambiguous") is False
+            for element in json.loads(proposal["elements"])
+        )
+        if not matched:
+            connection.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="Expected result was not detected; do not retry the action automatically",
+            )
+        result = json.loads(proposal["result"] or "{}")
+        result["verification_status"] = "verified"
+        result["message"] = "Approved desktop action verified by a later observation"
+        now = _utc_text()
+        connection.execute(
+            """
+            UPDATE computer_action_proposals
+            SET verification_status = 'verified', updated_at = ?
+            WHERE id = ? AND owner_id = ? AND verification_status = 'pending'
+            """,
+            (now, proposal_id, customer["id"]),
+        )
+        connection.execute(
+            "UPDATE agent_commands SET result = ?, updated_at = ? WHERE id = ? AND owner_id = ?",
+            (
+                json.dumps(result),
+                now,
+                proposal["command_id"],
+                customer["id"],
+            ),
+        )
+        _agent_audit(
+            connection,
+            customer["id"],
+            "computer_action_verified",
+            device_id=proposal["device_id"],
+            command_id=proposal["command_id"],
+            details={"proposal_id": proposal_id, "observation_id": request.observation_id},
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return {
+        "action_id": proposal_id,
+        "command_id": proposal["command_id"],
+        "verification_status": "verified",
+    }
+
+
+@app.post(
+    "/computer/agent/devices/{device_id}/commands/{command_id}/observation",
+    status_code=201,
+)
+async def upload_agent_observation(
+    device_id: str,
+    command_id: str,
+    request: Request,
+):
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/octet-stream":
+        raise HTTPException(status_code=415, detail="Screenshot must use application/octet-stream")
+    credential = request.headers.get("X-Device-Credential", "")
+    if not 32 <= len(credential) <= 128:
+        raise HTTPException(status_code=404, detail="Authorized capture command not found")
+    supplied_hash = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+
+    connection = get_db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        device = connection.execute(
+            """
+            SELECT owner_id, credential_hash, status, permissions
+            FROM agent_devices WHERE id = ?
+            """,
+            (device_id,),
+        ).fetchone()
+        command = connection.execute(
+            """
+            SELECT id FROM agent_commands
+            WHERE id = ? AND device_id = ? AND action = 'capture_screen'
+              AND status = 'executing'
+            """,
+            (command_id, device_id),
+        ).fetchone()
+        if (
+            device is None
+            or command is None
+            or not hmac.compare_digest(supplied_hash, device["credential_hash"])
+            or device["status"] != "connected"
+            or "capture_screen" not in json.loads(device["permissions"])
+            or _agent_safety_stopped(connection, device["owner_id"])
+        ):
+            connection.rollback()
+            raise HTTPException(status_code=404, detail="Authorized capture command not found")
+        if not _consume_agent_rate_limit(
+            connection, device["owner_id"], "observation", 10, window_seconds=60
+        ):
+            _agent_audit(
+                connection,
+                device["owner_id"],
+                "rate_limit_exceeded",
+                device_id=device_id,
+                command_id=command_id,
+                details={"scope": "observation"},
+            )
+            connection.commit()
+            raise HTTPException(status_code=429, detail="Observation rate limit exceeded")
+        owner_id = device["owner_id"]
+        approved_payload = json.loads(command["payload"])
+        connection.commit()
+    finally:
+        connection.close()
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_SCREENSHOT_BYTES:
+            raise HTTPException(status_code=413, detail="Screenshot exceeds the byte limit")
+        body.extend(chunk)
+    if not body:
+        raise HTTPException(status_code=400, detail="Screenshot is empty")
+    image_sha256 = hashlib.sha256(body).hexdigest()
+    active_window_identity = request.headers.get("X-Active-Window-Identity")
+    if active_window_identity is not None and not re.fullmatch(
+        r"[a-f0-9]{64}", active_window_identity
+    ):
+        raise HTTPException(status_code=422, detail="Active-window identity is invalid")
+    try:
+        observation = await asyncio.to_thread(
+            VisionEngine().analyze_screenshot,
+            bytes(body),
+            device_id,
+            approved_payload.get("vision_provider", "mock"),
+            approved_payload.get("redaction_boxes"),
+        )
+    except (ValueError, RuntimeError) as exc:
+        _audit_agent_protocol_failure(owner_id, device_id, "screenshot validation or analysis failed")
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    connection = get_db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        command = connection.execute(
+            """
+            SELECT c.owner_id, c.status, d.status AS device_status
+            FROM agent_commands c
+            JOIN agent_devices d ON d.id = c.device_id AND d.owner_id = c.owner_id
+            WHERE c.id = ? AND c.device_id = ? AND c.action = 'capture_screen'
+            """,
+            (command_id, device_id),
+        ).fetchone()
+        if (
+            command is None
+            or command["owner_id"] != owner_id
+            or command["status"] != "executing"
+            or command["device_status"] != "connected"
+            or _agent_safety_stopped(connection, owner_id)
+        ):
+            connection.rollback()
+            raise HTTPException(status_code=409, detail="Capture authorization expired")
+        _cleanup_expired_computer_data(connection, owner_id)
+        stored = _store_observation(
+            connection,
+            owner_id,
+            device_id,
+            "screen",
+            observation["screen_dimensions"]["width"],
+            observation["screen_dimensions"]["height"],
+            observation["provider"],
+            observation["elements"],
+            command_id=command_id,
+            image_sha256=image_sha256,
+            observation_id=observation["observation_id"],
+            active_window_identity=active_window_identity,
+        )
+        _agent_audit(
+            connection,
+            owner_id,
+            "screen_observation_created",
+            device_id=device_id,
+            command_id=command_id,
+            details={"observation_id": stored["observation_id"], "element_count": len(stored["elements"])},
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    return {
+        "status": "created",
+        "observation_id": stored["observation_id"],
+        "device_id": device_id,
+        "screen_dimensions": stored["screen_dimensions"],
+        "element_count": len(stored["elements"]),
+        "captured_at": stored["timestamp"],
+        "expires_at": stored["expires_at"],
+    }
+
+
 @app.post("/computer/agent/devices/{device_id}/commands", status_code=202)
 def request_agent_command(
     device_id: str,
@@ -2185,6 +3175,44 @@ def request_agent_command(
             connection.commit()
             raise HTTPException(status_code=403, detail="Device does not permit this action")
 
+        proposal = None
+        if request.action.startswith("browser_") or request.action == "click":
+            if not request.proposal_id:
+                raise HTTPException(status_code=422, detail="Action proposal approval is required")
+            proposal = connection.execute(
+                """
+                SELECT id, action, instruction, payload, payload_hash, status, expires_at
+                FROM computer_action_proposals
+                WHERE id = ? AND owner_id = ? AND device_id = ?
+                """,
+                (request.proposal_id, customer["id"], device_id),
+            ).fetchone()
+            if (
+                proposal is None
+                or proposal["status"] != "proposed"
+                or proposal["expires_at"] <= _utc_text()
+                or proposal["action"] != request.action
+                or proposal["payload"] != json.dumps(
+                    request.payload, separators=(",", ":"), sort_keys=True
+                )
+                or not hmac.compare_digest(
+                    payload_hash(
+                        request.action,
+                        request.payload,
+                        device_id,
+                        proposal_id=request.proposal_id,
+                        instruction=proposal["instruction"],
+                    ),
+                    proposal["payload_hash"],
+                )
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Action proposal is expired, changed, or already used",
+                )
+        elif request.proposal_id:
+            raise HTTPException(status_code=422, detail="Proposal does not match the action")
+
         now = _utc_now()
         command_id = str(uuid.uuid4())
         approval_id = str(uuid.uuid4())
@@ -2200,8 +3228,8 @@ def request_agent_command(
                 """
                 INSERT INTO agent_commands
                 (id, owner_id, device_id, client_request_id, action, payload,
-                 status, created_at, updated_at, deadline_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?, ?)
+                 proposal_id, status, created_at, updated_at, deadline_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?, ?)
                 """,
                 (
                     command_id,
@@ -2210,6 +3238,7 @@ def request_agent_command(
                     request.client_request_id,
                     request.action,
                     payload_json,
+                    request.proposal_id,
                     _utc_text(now),
                     _utc_text(now),
                     expires_at,
@@ -2229,11 +3258,26 @@ def request_agent_command(
                 customer["id"],
                 command_id,
                 hashlib.sha256(approval_token.encode("utf-8")).hexdigest(),
-                payload_hash(request.action, payload_json, device_id),
+                payload_hash(
+                    request.action,
+                    payload_json,
+                    device_id,
+                    proposal_id=request.proposal_id,
+                    instruction=proposal["instruction"] if proposal is not None else None,
+                ),
                 expires_at,
                 _utc_text(now),
             ),
         )
+        if proposal is not None:
+            connection.execute(
+                """
+                UPDATE computer_action_proposals
+                SET status = 'pending_approval', updated_at = ?
+                WHERE id = ? AND owner_id = ? AND status = 'proposed'
+                """,
+                (_utc_text(now), request.proposal_id, customer["id"]),
+            )
         _agent_audit(
             connection,
             customer["id"],
@@ -2254,7 +3298,7 @@ def request_agent_command(
             "expires_at": expires_at,
             "approval_token": approval_token,
         },
-        "execution_enabled": DESKTOP_EXECUTION_ENABLED,
+        "execution_enabled": _action_execution_enabled(request.action),
     }
 
 
@@ -2302,8 +3346,10 @@ def deny_agent_approval(
         connection.execute("BEGIN IMMEDIATE")
         approval = connection.execute(
             """
-            SELECT id, command_id, token_hash, expires_at FROM agent_approvals
-            WHERE id = ? AND owner_id = ? AND status = 'pending'
+            SELECT a.id, a.command_id, a.token_hash, a.expires_at, c.proposal_id
+            FROM agent_approvals a
+            JOIN agent_commands c ON c.id = a.command_id AND c.owner_id = a.owner_id
+            WHERE a.id = ? AND a.owner_id = ? AND a.status = 'pending'
             """,
             (request_id, customer["id"]),
         ).fetchone()
@@ -2342,6 +3388,14 @@ def deny_agent_approval(
                 """,
                 (now, approval["command_id"], customer["id"]),
             )
+            if approval["proposal_id"]:
+                connection.execute(
+                    """
+                    UPDATE computer_action_proposals SET status = 'expired', updated_at = ?
+                    WHERE id = ? AND owner_id = ?
+                    """,
+                    (now, approval["proposal_id"], customer["id"]),
+                )
             _agent_audit(
                 connection,
                 customer["id"],
@@ -2364,6 +3418,14 @@ def deny_agent_approval(
             """,
             (now, approval["command_id"], customer["id"]),
         )
+        if approval["proposal_id"]:
+            connection.execute(
+                """
+                UPDATE computer_action_proposals SET status = 'failed', updated_at = ?
+                WHERE id = ? AND owner_id = ?
+                """,
+                (now, approval["proposal_id"], customer["id"]),
+            )
         _agent_audit(
             connection,
             customer["id"],
@@ -2393,9 +3455,15 @@ async def approve_agent_command(
         approval = connection.execute(
             """
             SELECT a.id, a.command_id, a.token_hash, a.payload_hash, a.expires_at,
-                   c.device_id, c.action, c.payload
+                   c.device_id, c.action, c.payload, c.proposal_id,
+                   p.status AS proposal_status, p.expires_at AS proposal_expires_at,
+                   p.action AS proposal_action, p.payload AS proposal_payload,
+                   p.payload_hash AS proposal_payload_hash,
+                   p.instruction AS proposal_instruction
             FROM agent_approvals a
             JOIN agent_commands c ON c.id = a.command_id
+            LEFT JOIN computer_action_proposals p
+              ON p.id = c.proposal_id AND p.owner_id = c.owner_id
             WHERE a.id = ? AND a.owner_id = ? AND a.status = 'pending'
               AND c.owner_id = ?
               AND c.status = 'pending_approval'
@@ -2437,6 +3505,14 @@ async def approve_agent_command(
                 """,
                 (now, approval["command_id"], customer["id"]),
             )
+            if approval["proposal_id"]:
+                connection.execute(
+                    """
+                    UPDATE computer_action_proposals SET status = 'expired', updated_at = ?
+                    WHERE id = ? AND owner_id = ?
+                    """,
+                    (now, approval["proposal_id"], customer["id"]),
+                )
             _agent_audit(
                 connection,
                 customer["id"],
@@ -2451,6 +3527,8 @@ async def approve_agent_command(
                 approval["action"],
                 approval["payload"],
                 approval["device_id"],
+                proposal_id=approval["proposal_id"],
+                instruction=approval["proposal_instruction"],
             )
         except (TypeError, ValueError, json.JSONDecodeError):
             current_payload_hash = ""
@@ -2470,6 +3548,14 @@ async def approve_agent_command(
                 """,
                 (now, approval["command_id"], customer["id"]),
             )
+            if approval["proposal_id"]:
+                connection.execute(
+                    """
+                    UPDATE computer_action_proposals SET status = 'failed', updated_at = ?
+                    WHERE id = ? AND owner_id = ?
+                    """,
+                    (now, approval["proposal_id"], customer["id"]),
+                )
             _agent_audit(
                 connection,
                 customer["id"],
@@ -2479,6 +3565,46 @@ async def approve_agent_command(
             )
             connection.commit()
             raise HTTPException(status_code=409, detail="Command payload changed after approval request")
+
+        if approval["proposal_id"] and (
+            approval["proposal_status"] != "pending_approval"
+            or approval["proposal_expires_at"] <= now
+            or approval["proposal_action"] != approval["action"]
+            or approval["proposal_payload"] != approval["payload"]
+            or not hmac.compare_digest(
+                payload_hash(
+                    approval["action"],
+                    approval["payload"],
+                    approval["device_id"],
+                    proposal_id=approval["proposal_id"],
+                    instruction=approval["proposal_instruction"],
+                ),
+                approval["proposal_payload_hash"],
+            )
+        ):
+            connection.execute(
+                """
+                UPDATE agent_approvals SET status = 'expired', consumed_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (now, request_id),
+            )
+            connection.execute(
+                """
+                UPDATE agent_commands SET status = 'expired', updated_at = ?
+                WHERE id = ? AND owner_id = ? AND status = 'pending_approval'
+                """,
+                (now, approval["command_id"], customer["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE computer_action_proposals SET status = 'expired', updated_at = ?
+                WHERE id = ? AND owner_id = ?
+                """,
+                (now, approval["proposal_id"], customer["id"]),
+            )
+            connection.commit()
+            raise HTTPException(status_code=409, detail="Action proposal changed or expired")
 
         device = connection.execute(
             """
@@ -2518,13 +3644,21 @@ async def approve_agent_command(
         if approval_updated != 1 or command_updated != 1:
             connection.rollback()
             raise HTTPException(status_code=409, detail="Approval was already consumed")
+        if approval["proposal_id"]:
+            connection.execute(
+                """
+                UPDATE computer_action_proposals SET status = 'approved', updated_at = ?
+                WHERE id = ? AND owner_id = ? AND status = 'pending_approval'
+                """,
+                (now, approval["proposal_id"], customer["id"]),
+            )
         _agent_audit(
             connection,
             customer["id"],
             "command_approved",
             device_id=approval["device_id"],
             command_id=approval["command_id"],
-            details={"execution_enabled": DESKTOP_EXECUTION_ENABLED},
+            details={"execution_enabled": _action_execution_enabled(approval["action"])},
         )
         connection.commit()
     except Exception:
@@ -2549,7 +3683,7 @@ async def approve_agent_command(
                 "command_id": approval["command_id"],
                 "action": dispatch["action"],
                 "payload": json.loads(dispatch["payload"]),
-                "execution_enabled": DESKTOP_EXECUTION_ENABLED,
+                "execution_enabled": _action_execution_enabled(dispatch["action"]),
             }
             try:
                 validate_command(command)
@@ -2597,7 +3731,13 @@ async def approve_agent_command(
         else:
             result = await asyncio.wait_for(
                 response_future,
-                timeout=AGENT_COMMAND_TIMEOUT_SECONDS,
+                timeout=(
+                    AGENT_SCREEN_ANALYSIS_TIMEOUT_SECONDS
+                    if approval["action"] == "capture_screen"
+                    else AGENT_BROWSER_TIMEOUT_SECONDS
+                    if approval["action"].startswith("browser_")
+                    else AGENT_COMMAND_TIMEOUT_SECONDS
+                ),
             )
     except asyncio.CancelledError:
         _fail_agent_command(
@@ -2632,7 +3772,7 @@ async def approve_agent_command(
         "command_id": approval["command_id"],
         "status": "failed" if not result["success"] else "completed",
         "result": result,
-        "execution_enabled": DESKTOP_EXECUTION_ENABLED,
+        "execution_enabled": _action_execution_enabled(approval["action"]),
     }
 
 
@@ -2642,8 +3782,9 @@ def _begin_agent_dispatch(command_id, owner_id):
         connection.execute("BEGIN IMMEDIATE")
         command = connection.execute(
             """
-            SELECT c.id, c.device_id, c.action, c.payload, c.status,
-                   a.payload_hash, d.status AS device_status, d.permissions
+            SELECT c.id, c.device_id, c.action, c.payload, c.proposal_id, c.status,
+                   a.id AS approval_ref, a.payload_hash,
+                   d.status AS device_status, d.permissions
             FROM agent_commands c
             JOIN agent_approvals a ON a.command_id = c.id AND a.owner_id = c.owner_id
             JOIN agent_devices d ON d.id = c.device_id AND d.owner_id = c.owner_id
@@ -2655,6 +3796,68 @@ def _begin_agent_dispatch(command_id, owner_id):
         if command is None:
             connection.rollback()
             return None
+        approval_ref = command["approval_ref"]
+
+        proposal_instruction = None
+        if command["proposal_id"]:
+            proposal = connection.execute(
+                """
+                SELECT action, instruction, payload, payload_hash, status, expires_at
+                FROM computer_action_proposals
+                WHERE id = ? AND owner_id = ? AND device_id = ?
+                """,
+                (command["proposal_id"], owner_id, command["device_id"]),
+            ).fetchone()
+            if (
+                proposal is None
+                or proposal["status"] != "approved"
+                or proposal["expires_at"] <= _utc_text()
+                or proposal["action"] != command["action"]
+                or proposal["payload"] != command["payload"]
+                or not hmac.compare_digest(
+                    payload_hash(
+                        command["action"],
+                        command["payload"],
+                        command["device_id"],
+                        proposal_id=command["proposal_id"],
+                        instruction=proposal["instruction"],
+                    ),
+                    proposal["payload_hash"],
+                )
+            ):
+                connection.rollback()
+                return None
+            proposal_instruction = proposal["instruction"]
+            if command["action"] in {
+                "browser_fill", "browser_submit", "browser_download"
+            }:
+                try:
+                    browser_payload = json.loads(command["payload"])
+                except (TypeError, json.JSONDecodeError):
+                    connection.rollback()
+                    return None
+                browser_session = connection.execute(
+                    """
+                    SELECT status, expires_at, page_identity, navigation_generation
+                    FROM browser_sessions
+                    WHERE id = ? AND owner_id = ? AND device_id = ?
+                    """,
+                    (
+                        browser_payload.get("session_id"),
+                        owner_id,
+                        command["device_id"],
+                    ),
+                ).fetchone()
+                if (
+                    browser_session is None
+                    or browser_session["status"] != "active"
+                    or browser_session["expires_at"] <= _utc_text()
+                    or browser_session["page_identity"] != browser_payload.get("page_identity")
+                    or browser_session["navigation_generation"]
+                    != browser_payload.get("navigation_generation")
+                ):
+                    connection.rollback()
+                    return None
 
         if _agent_safety_stopped(connection, owner_id):
             now = _utc_text()
@@ -2700,7 +3903,14 @@ def _begin_agent_dispatch(command_id, owner_id):
             permissions = json.loads(command["permissions"])
         except (TypeError, json.JSONDecodeError):
             permissions = []
-        if not isinstance(permissions, list) or command["action"] not in permissions:
+        if (
+            not isinstance(permissions, list)
+            or command["action"] not in permissions
+            or (
+                command["action"] == "click"
+                and "capture_screen" not in permissions
+            )
+        ):
             now = _utc_text()
             result = {
                 "command_id": command_id,
@@ -2720,7 +3930,7 @@ def _begin_agent_dispatch(command_id, owner_id):
             connection.commit()
             return None
 
-        if DESKTOP_EXECUTION_ENABLED:
+        if _action_execution_enabled(command["action"]):
             capability = connection.execute(
                 """
                 SELECT capabilities FROM agent_desktop_capabilities
@@ -2733,8 +3943,16 @@ def _begin_agent_dispatch(command_id, owner_id):
                 try:
                     reported = json.loads(capability["capabilities"])
                     capability_allowed = (
-                        reported.get("desktop_execution") is True
+                        (
+                            reported.get("browser_automation") is True
+                            if command["action"].startswith("browser_")
+                            else reported.get("desktop_execution") is True
+                        )
                         and reported.get(command["action"]) is True
+                        and (
+                            command["action"] != "click"
+                            or reported.get("capture_screen") is True
+                        )
                     )
                 except (TypeError, json.JSONDecodeError):
                     capability_allowed = False
@@ -2770,6 +3988,8 @@ def _begin_agent_dispatch(command_id, owner_id):
                 command["action"],
                 command["payload"],
                 command["device_id"],
+                proposal_id=command["proposal_id"],
+                instruction=proposal_instruction,
             )
         except (TypeError, ValueError, json.JSONDecodeError):
             current_hash = ""
@@ -2793,10 +4013,107 @@ def _begin_agent_dispatch(command_id, owner_id):
             connection.commit()
             return None
 
+        if command["action"] == "click":
+            try:
+                click_payload = json.loads(command["payload"])
+                observation = connection.execute(
+                    """
+                    SELECT source, screen_width, screen_height, image_sha256,
+                           active_window_identity, elements, captured_at, expires_at
+                    FROM computer_observations
+                    WHERE id = ? AND owner_id = ? AND device_id = ?
+                    """,
+                    (
+                        click_payload.get("observation_id"),
+                        owner_id,
+                        command["device_id"],
+                    ),
+                ).fetchone()
+                elements = json.loads(observation["elements"]) if observation else []
+                target = next(
+                    (
+                        item for item in elements
+                        if isinstance(item, dict)
+                        and item.get("element_id") == click_payload.get("target_element_id")
+                    ),
+                    None,
+                )
+                target_box = target.get("bounding_box") if target else None
+                observation_valid = (
+                    observation is not None
+                    and observation["source"] == "screen"
+                    and observation["expires_at"] > _utc_text()
+                    and observation["image_sha256"] == click_payload.get("observation_image_sha256")
+                    and observation["active_window_identity"]
+                    == click_payload.get("active_window_identity")
+                    and observation["captured_at"] == click_payload.get("observation_captured_at")
+                    and observation["screen_width"] == click_payload.get("screen_width")
+                    and observation["screen_height"] == click_payload.get("screen_height")
+                    and command["device_id"] == click_payload.get("device_id")
+                    and target is not None
+                    and target.get("type") == "button"
+                    and target_box == click_payload.get("target_bbox")
+                    and isinstance(target_box, dict)
+                    and click_payload.get("x")
+                    == int(target_box["x"] + target_box["width"] / 2)
+                    and click_payload.get("y")
+                    == int(target_box["y"] + target_box["height"] / 2)
+                    and command["approval_ref"]
+                )
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                observation_valid = False
+            if not observation_valid:
+                now = _utc_text()
+                result = {
+                    "command_id": command_id,
+                    "action": "click",
+                    "success": False,
+                    "message": "Approved desktop observation is stale or invalid; obtain a new observation and approval",
+                    "failure_code": "desktop_click_stale",
+                }
+                connection.execute(
+                    """
+                    UPDATE agent_commands
+                    SET status = 'failed', result = ?, updated_at = ?
+                    WHERE id = ? AND owner_id = ? AND status = 'approved'
+                    """,
+                    (json.dumps(result), now, command_id, owner_id),
+                )
+                if command["proposal_id"]:
+                    connection.execute(
+                        """
+                        UPDATE computer_action_proposals SET status = 'failed',
+                            verification_status = 'failed', updated_at = ?
+                        WHERE id = ? AND owner_id = ?
+                        """,
+                        (now, command["proposal_id"], owner_id),
+                    )
+                _agent_audit(
+                    connection,
+                    owner_id,
+                    "desktop_click_rejected_stale",
+                    device_id=command["device_id"],
+                    command_id=command_id,
+                    details={
+                        "reason": "approved observation binding invalid",
+                        "observation_id": click_payload.get("observation_id"),
+                    },
+                )
+                connection.commit()
+                return None
+
         connection.execute(
             "UPDATE agent_commands SET status = 'queued', updated_at = ? WHERE id = ? AND status = 'approved'",
             (_utc_text(), command_id),
         )
+        if command["proposal_id"]:
+            connection.execute(
+                """
+                UPDATE computer_action_proposals SET status = 'executing', updated_at = ?
+                WHERE id = ? AND owner_id = ? AND status = 'approved'
+                """,
+                (_utc_text(), command["proposal_id"], owner_id),
+            )
         _agent_audit(connection, owner_id, "command_queued", device_id=command["device_id"], command_id=command_id)
         connection.commit()
     except Exception:
@@ -2858,7 +4175,14 @@ def _begin_agent_dispatch(command_id, owner_id):
             connection.commit()
             return None
         now = _utc_text()
-        deadline = _utc_text(_utc_now() + timedelta(seconds=AGENT_COMMAND_TIMEOUT_SECONDS))
+        timeout_seconds = (
+            AGENT_SCREEN_ANALYSIS_TIMEOUT_SECONDS
+            if command["action"] == "capture_screen"
+            else AGENT_BROWSER_TIMEOUT_SECONDS
+            if command["action"].startswith("browser_")
+            else AGENT_COMMAND_TIMEOUT_SECONDS
+        )
+        deadline = _utc_text(_utc_now() + timedelta(seconds=timeout_seconds))
         claimed = connection.execute(
             """
             UPDATE agent_commands
@@ -2894,10 +4218,17 @@ def _begin_agent_dispatch(command_id, owner_id):
             "command_dispatched",
             device_id=command["device_id"],
             command_id=command_id,
-            details={"execution_enabled": DESKTOP_EXECUTION_ENABLED},
+            details={"execution_enabled": _action_execution_enabled(command["action"])},
         )
         connection.commit()
-        return dict(command)
+        dispatch_command = dict(command)
+        if dispatch_command["action"] == "click":
+            command_payload = json.loads(dispatch_command["payload"])
+            command_payload["approval_ref"] = approval_ref
+            dispatch_command["payload"] = json.dumps(
+                command_payload, separators=(",", ":"), sort_keys=True
+            )
+        return dispatch_command
     except Exception:
         connection.rollback()
         raise
@@ -2957,7 +4288,7 @@ async def _record_agent_result(device_id, incoming):
         connection.execute("BEGIN IMMEDIATE")
         command = connection.execute(
             """
-            SELECT id, owner_id, action, deadline_at
+            SELECT id, owner_id, action, payload, proposal_id, deadline_at
             FROM agent_commands
             WHERE id = ? AND device_id = ? AND status = 'executing'
             """,
@@ -3005,6 +4336,115 @@ async def _record_agent_result(device_id, incoming):
             connection.commit()
             return False
 
+        command_payload = json.loads(command["payload"])
+        if command["action"].startswith("browser_"):
+            if incoming.session_id != command_payload.get("session_id"):
+                connection.rollback()
+                return False
+            if incoming.action != "browser_close" and incoming.success and (
+                incoming.page_identity is None
+                or incoming.navigation_generation is None
+                or not re.fullmatch(r"[a-f0-9-]{36}", incoming.page_identity)
+                or incoming.navigation_generation < 1
+            ):
+                connection.rollback()
+                return False
+            if incoming.action != "browser_close" and incoming.page_identity is not None:
+                session_state = connection.execute(
+                    """
+                    SELECT status, page_identity, navigation_generation
+                    FROM browser_sessions
+                    WHERE id = ? AND owner_id = ? AND device_id = ?
+                    """,
+                    (
+                        incoming.session_id,
+                        command["owner_id"],
+                        device_id,
+                    ),
+                ).fetchone()
+                if (
+                    session_state is None
+                    or session_state["status"] not in {"planned", "active"}
+                    or (
+                        session_state["page_identity"] is not None
+                        and session_state["page_identity"] != incoming.page_identity
+                    )
+                    or (
+                        session_state["navigation_generation"] is not None
+                        and incoming.navigation_generation
+                        < session_state["navigation_generation"]
+                    )
+                ):
+                    connection.rollback()
+                    return False
+        elif incoming.session_id is not None:
+            connection.rollback()
+            return False
+        if incoming.failure_code is not None and (
+            incoming.action != "click" or incoming.success
+        ):
+            connection.rollback()
+            return False
+
+        stored_observation = None
+        if incoming.observation is not None:
+            if command["action"] != "browser_inspect_controls":
+                connection.rollback()
+                return False
+            try:
+                (
+                    width,
+                    height,
+                    elements,
+                    browser_session_id,
+                    page_identity,
+                    navigation_generation,
+                ) = _validate_dom_observation(incoming.observation)
+            except ValueError:
+                connection.rollback()
+                return False
+            if (
+                browser_session_id != command_payload.get("session_id")
+                or incoming.page_identity != page_identity
+                or incoming.navigation_generation != navigation_generation
+            ):
+                connection.rollback()
+                return False
+            stored_observation = _store_observation(
+                connection,
+                command["owner_id"],
+                device_id,
+                "browser_dom",
+                width,
+                height,
+                "playwright-dom",
+                elements,
+                command_id=incoming.command_id,
+                browser_session_id=browser_session_id,
+                page_identity=page_identity,
+                navigation_generation=navigation_generation,
+            )
+        if incoming.observation_id is not None:
+            observation = connection.execute(
+                """
+                SELECT id FROM computer_observations
+                WHERE id = ? AND owner_id = ? AND device_id = ? AND command_id = ?
+                """,
+                (
+                    incoming.observation_id,
+                    command["owner_id"],
+                    device_id,
+                    incoming.command_id,
+                ),
+            ).fetchone()
+            if command["action"] != "capture_screen" or observation is None:
+                connection.rollback()
+                return False
+            stored_observation = {"observation_id": incoming.observation_id}
+        if command["action"] == "capture_screen" and incoming.success and stored_observation is None:
+            connection.rollback()
+            return False
+
         capability = connection.execute(
             """
             SELECT capabilities FROM agent_desktop_capabilities
@@ -3017,14 +4457,23 @@ async def _record_agent_result(device_id, incoming):
             try:
                 reported = json.loads(capability["capabilities"])
                 capability_allowed = (
-                    DESKTOP_EXECUTION_ENABLED
-                    and reported.get("desktop_execution") is True
+                    _action_execution_enabled(incoming.action)
+                    and (
+                        reported.get("browser_automation") is True
+                        if incoming.action.startswith("browser_")
+                        else reported.get("desktop_execution") is True
+                    )
                     and reported.get(incoming.action) is True
                 )
             except (TypeError, json.JSONDecodeError):
                 capability_allowed = False
 
-        if incoming.success and capability_allowed:
+        needs_verification = incoming.action == "browser_submit"
+        verified = (
+            not needs_verification
+            or incoming.verification_status == "verified"
+        )
+        if incoming.success and capability_allowed and verified:
             status = "completed"
             result = {
                 "command_id": incoming.command_id,
@@ -3032,47 +4481,196 @@ async def _record_agent_result(device_id, incoming):
                 "success": True,
                 "message": incoming.message,
             }
-            audit_reason = "local desktop action completed"
+            audit_reason = "approved computer action completed"
         else:
             status = "failed"
-            if not DESKTOP_EXECUTION_ENABLED:
-                message = "Desktop execution is disabled"
-                audit_reason = "desktop execution disabled"
+            if not _action_execution_enabled(incoming.action):
+                message = (
+                    "Browser automation is disabled"
+                    if incoming.action.startswith("browser_")
+                    else "Desktop execution is disabled"
+                )
+                audit_reason = "computer execution disabled"
             elif not capability_allowed:
-                message = "Desktop capability was unavailable"
-                audit_reason = "desktop capability unavailable"
+                message = "Computer capability was unavailable"
+                audit_reason = "computer capability unavailable"
+            elif needs_verification and not verified:
+                message = (
+                    "Submission may have occurred but was not verified; do not retry"
+                )
+                audit_reason = "external action was not verified; retry prohibited"
             else:
                 message = incoming.message
-                audit_reason = "local desktop action failed"
+                audit_reason = (
+                    "desktop click rejected as stale; new approval required"
+                    if incoming.failure_code == "desktop_click_stale"
+                    else "computer action failed"
+                )
             result = {
                 "command_id": incoming.command_id,
                 "action": incoming.action,
                 "success": False,
                 "message": message,
             }
+        if incoming.failure_code is not None:
+            result["failure_code"] = incoming.failure_code
+        for key in ("session_id", "verification_status"):
+            value = getattr(incoming, key)
+            if value is not None:
+                result[key] = value
+        if incoming.page_identity is not None:
+            result["page_identity"] = incoming.page_identity
+        if incoming.navigation_generation is not None:
+            result["navigation_generation"] = incoming.navigation_generation
+        if incoming.session_closed is not None:
+            result["session_closed"] = incoming.session_closed
+        if stored_observation is not None:
+            result["observation_id"] = stored_observation["observation_id"]
+        if incoming.data is not None:
+            result["data"] = incoming.data
+
+        persisted_result = {
+            key: value for key, value in result.items() if key != "data"
+        }
+        persisted_payload = (
+            "{}" if incoming.action == "browser_fill" else command["payload"]
+        )
         connection.execute(
             """
-            UPDATE agent_commands SET status = ?, result = ?, updated_at = ?
+            UPDATE agent_commands SET status = ?, payload = ?, result = ?, updated_at = ?
             WHERE id = ? AND owner_id = ? AND device_id = ? AND status = 'executing'
             """,
             (
                 status,
-                json.dumps(result),
+                persisted_payload,
+                json.dumps(persisted_result),
                 _utc_text(),
                 incoming.command_id,
                 command["owner_id"],
                 device_id,
             ),
         )
+        if command["proposal_id"]:
+            connection.execute(
+                """
+                UPDATE computer_action_proposals SET status = ?, updated_at = ?
+                    , verification_status = CASE
+                    WHEN ? = 'desktop_click_stale' THEN 'failed'
+                        WHEN ? = 'verified' THEN 'verified'
+                        WHEN ? = 'failed' THEN 'failed'
+                        ELSE verification_status
+                    END
+                WHERE id = ? AND owner_id = ?
+                """,
+                (
+                    "completed" if status == "completed" else "failed",
+                    _utc_text(),
+                        incoming.failure_code,
+                        incoming.verification_status,
+                        incoming.verification_status,
+                    command["proposal_id"],
+                    command["owner_id"],
+                ),
+            )
+        if incoming.session_id is not None:
+            if incoming.action == "browser_close" or incoming.session_closed is True:
+                connection.execute(
+                    """
+                    UPDATE browser_sessions
+                    SET status = 'closed', initial_url = NULL,
+                        page_identity = NULL, navigation_generation = NULL
+                    WHERE id = ? AND owner_id = ? AND device_id = ?
+                    """,
+                    (incoming.session_id, command["owner_id"], device_id),
+                )
+                page_changed = True
+            elif incoming.page_identity is not None and incoming.navigation_generation is not None:
+                previous_page = connection.execute(
+                    """
+                    SELECT page_identity, navigation_generation
+                    FROM browser_sessions
+                    WHERE id = ? AND owner_id = ? AND device_id = ?
+                    """,
+                    (incoming.session_id, command["owner_id"], device_id),
+                ).fetchone()
+                if previous_page is None:
+                    connection.rollback()
+                    return False
+                page_changed = (
+                    previous_page["page_identity"] != incoming.page_identity
+                    or previous_page["navigation_generation"]
+                    != incoming.navigation_generation
+                )
+                connection.execute(
+                    """
+                    UPDATE browser_sessions
+                    SET status = 'active', page_identity = ?,
+                        navigation_generation = ?
+                    WHERE id = ? AND owner_id = ? AND device_id = ?
+                    """,
+                    (
+                        incoming.page_identity,
+                        incoming.navigation_generation,
+                        incoming.session_id,
+                        command["owner_id"],
+                        device_id,
+                    ),
+                )
+            else:
+                page_changed = False
+            if page_changed:
+                stale_proposals = connection.execute(
+                    """
+                    SELECT p.id, c.id AS command_id
+                    FROM computer_action_proposals p
+                    LEFT JOIN agent_commands c
+                      ON c.proposal_id = p.id AND c.owner_id = p.owner_id
+                    WHERE p.browser_session_id = ? AND p.owner_id = ?
+                      AND p.status IN ('proposed', 'pending_approval', 'approved')
+                    """,
+                    (incoming.session_id, command["owner_id"]),
+                ).fetchall()
+                for stale in stale_proposals:
+                    connection.execute(
+                        """
+                        UPDATE computer_action_proposals SET status = 'failed',
+                            updated_at = ?
+                        WHERE id = ? AND owner_id = ?
+                        """,
+                        (_utc_text(), stale["id"], command["owner_id"]),
+                    )
+                    if stale["command_id"] is not None:
+                        connection.execute(
+                            """
+                            UPDATE agent_approvals SET status = 'cancelled',
+                                consumed_at = ?
+                            WHERE command_id = ? AND owner_id = ? AND status = 'pending'
+                            """,
+                            (_utc_text(), stale["command_id"], command["owner_id"]),
+                        )
+                        connection.execute(
+                            """
+                            UPDATE agent_commands SET status = 'cancelled',
+                                updated_at = ?
+                            WHERE id = ? AND owner_id = ?
+                              AND status IN ('pending_approval', 'approved')
+                            """,
+                            (_utc_text(), stale["command_id"], command["owner_id"]),
+                        )
         _agent_audit(
             connection,
             command["owner_id"],
-            "command_completed" if status == "completed" else "command_failed",
+            (
+                "desktop_click_rejected_stale"
+                if incoming.failure_code == "desktop_click_stale"
+                else "command_completed" if status == "completed" else "command_failed"
+            ),
             device_id=device_id,
             command_id=incoming.command_id,
             details={
                 "reason": audit_reason,
                 "agent_claimed_success": incoming.success,
+                "verification_status": incoming.verification_status,
             },
         )
         connection.execute(
@@ -3283,6 +4881,7 @@ async def local_agent_websocket(websocket: WebSocket, device_id: str):
                     or len(session_type) > 32
                     or set(capabilities) - set(LOCAL_AGENT_ALLOWED_ACTIONS) - {
                         "desktop_execution",
+                        "browser_automation",
                         "x11",
                         "wayland",
                     }

@@ -6,3 +6,5 @@ PyJWT
 python-dotenv
 pydantic
 websockets>=14,<16
+Pillow>=10,<12
+playwright>=1.55,<2

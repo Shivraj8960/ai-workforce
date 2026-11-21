@@ -1,16 +1,20 @@
 """Fail-closed modular desktop runtime for the Local Agent."""
 
 import hashlib
+import io
 import os
+import re
 import shutil
 import subprocess
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable
 
 
 MAX_TEXT_CHARS = 500
 MAX_FILE_BYTES = 65536
+MAX_CAPTURE_BYTES = 5 * 1024 * 1024
 
 ACTION_SPECS = {
     "open_app": {"payload_keys": frozenset({"app_id"})},
@@ -19,6 +23,11 @@ ACTION_SPECS = {
     "input_text": {"payload_keys": frozenset({"text"})},
     "read_file": {"payload_keys": frozenset({"path"})},
     "write_file": {"payload_keys": frozenset({"path", "content"})},
+    "click": {
+        "payload_keys": frozenset(
+            {"x", "y", "screen_width", "screen_height", "observation_id"}
+        )
+    },
 }
 
 APP_EXECUTABLES = {
@@ -44,9 +53,14 @@ def _session_type() -> str:
 class DesktopRuntime:
     def __init__(self) -> None:
         self._stopped = threading.Event()
+        self._browser_runtime = None
+        self._click_lock = threading.Lock()
+        self._used_click_approvals = set()
 
     def stop(self) -> None:
         self._stopped.set()
+        if self._browser_runtime is not None:
+            self._browser_runtime.stop()
 
     def reset(self) -> None:
         self._stopped.clear()
@@ -57,33 +71,40 @@ class DesktopRuntime:
     def capabilities(self) -> Dict[str, bool]:
         session = _session_type()
         x11 = session == "x11"
+        xdotool_available = shutil.which("xdotool") is not None
         wayland_capture = (
             session == "wayland"
             and os.getenv("NEX_DESKTOP_ALLOW_WAYLAND_CAPTURE", "").strip().lower()
             == "true"
             and shutil.which("grim") is not None
         )
-        return {
+        capabilities = {
             "open_app": desktop_execution_enabled(),
             "capture_screen": desktop_execution_enabled()
             and (x11 or wayland_capture),
             "get_active_window": desktop_execution_enabled() and x11
-            and shutil.which("xdotool") is not None,
+            and xdotool_available,
             "input_text": desktop_execution_enabled() and x11
-            and shutil.which("xdotool") is not None,
+            and xdotool_available,
+            "click": desktop_execution_enabled() and x11 and xdotool_available,
             "read_file": desktop_execution_enabled() and bool(_filesystem_roots()),
             "write_file": desktop_execution_enabled() and bool(_filesystem_roots()),
             "desktop_execution": desktop_execution_enabled(),
             "x11": x11,
             "wayland": session == "wayland",
         }
+        capabilities.update(self._browser().capabilities())
+        return capabilities
 
     def execute(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        if not desktop_execution_enabled():
-            return {"success": False, "message": "Desktop execution is disabled"}
         if self.is_stopped():
             return {"success": False, "message": "Desktop runtime emergency stop is active"}
 
+        if action.startswith("browser_"):
+            return self._browser().execute(action, payload)
+
+        if not desktop_execution_enabled():
+            return {"success": False, "message": "Desktop execution is disabled"}
         capabilities = self.capabilities()
         if action not in ACTION_SPECS or not capabilities.get(action, False):
             return {"success": False, "message": "Desktop capability is unavailable"}
@@ -100,7 +121,16 @@ class DesktopRuntime:
             return self._read_file(payload["path"])
         if action == "write_file":
             return self._write_file(payload["path"], payload["content"])
+        if action == "click":
+            return self._click(payload)
         return {"success": False, "message": "Desktop action is unsupported"}
+
+    def _browser(self):
+        if self._browser_runtime is None:
+            from browser_runtime import BrowserAutomationRuntime
+
+            self._browser_runtime = BrowserAutomationRuntime()
+        return self._browser_runtime
 
     def _open_app(self, app_id: str) -> Dict[str, Any]:
         executable = None
@@ -132,6 +162,7 @@ class DesktopRuntime:
             return {"success": False, "message": "Screen capture directory permissions are unsafe"}
         capture_file = directory / "capture.png"
         try:
+            window_before = self._active_window_identity()
             session = _session_type()
             if session == "x11":
                 screenshot = shutil.which("gnome-screenshot")
@@ -168,12 +199,25 @@ class DesktopRuntime:
             return {"success": False, "message": "Screen capture failed"}
 
         try:
+            if capture_file.stat().st_size > MAX_CAPTURE_BYTES:
+                capture_file.unlink(missing_ok=True)
+                return {"success": False, "message": "Captured screen exceeded the safety limit"}
             capture_bytes = capture_file.read_bytes()
         except OSError:
-            return {"success": False, "message": "Captured screen could not be read"}
-        if len(capture_bytes) > 20 * 1024 * 1024:
             capture_file.unlink(missing_ok=True)
-            return {"success": False, "message": "Captured screen exceeded the safety limit"}
+            return {"success": False, "message": "Captured screen could not be read"}
+        window_after = self._active_window_identity()
+        if window_before != window_after:
+            capture_file.unlink(missing_ok=True)
+            return {"success": False, "message": "Active window changed during screen capture"}
+        try:
+            from PIL import Image
+
+            with Image.open(io.BytesIO(capture_bytes)) as image:
+                width, height = image.size
+        except (ImportError, OSError, ValueError):
+            capture_file.unlink(missing_ok=True)
+            return {"success": False, "message": "Captured screen dimensions are unavailable"}
         digest = hashlib.sha256(capture_bytes).hexdigest()
         capture_file.unlink(missing_ok=True)
         return {
@@ -181,7 +225,32 @@ class DesktopRuntime:
             "message": "Screen captured",
             "capture_sha256": digest,
             "capture_bytes": len(capture_bytes),
+            "screen_width": width,
+            "screen_height": height,
+            "active_window_identity": window_after,
+            "image_bytes": capture_bytes,
         }
+
+    def _active_window_identity(self):
+        xdotool = shutil.which("xdotool")
+        if xdotool is None or _session_type() != "x11":
+            return None
+        try:
+            result = subprocess.run(
+                [xdotool, "getactivewindow"],
+                check=True,
+                timeout=5,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        window_id = result.stdout.strip()
+        if not window_id or not window_id.isdigit():
+            return None
+        return hashlib.sha256(window_id.encode("ascii")).hexdigest()
 
     def _get_active_window(self) -> Dict[str, Any]:
         xdotool = shutil.which("xdotool")
@@ -222,6 +291,141 @@ class DesktopRuntime:
         except (OSError, subprocess.SubprocessError):
             return {"success": False, "message": "Approved input could not be sent"}
         return {"success": True, "message": "Approved text input sent"}
+
+    def _click(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        approval_ref = payload.get("approval_ref")
+        if not isinstance(approval_ref, str) or not approval_ref:
+            return self._stale_click("Desktop click approval binding is missing")
+        with self._click_lock:
+            if approval_ref in self._used_click_approvals:
+                return self._stale_click("Approved desktop click was already attempted")
+            self._used_click_approvals.add(approval_ref)
+
+        binding = (
+            payload.get("device_id"),
+            payload.get("observation_id"),
+            payload.get("target_element_id"),
+            payload.get("observation_captured_at"),
+            payload.get("observation_expires_at"),
+            payload.get("observation_image_sha256"),
+            payload.get("active_window_identity"),
+        )
+        if (
+            any(not isinstance(value, str) or not value for value in binding)
+            or not re.fullmatch(
+                r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}",
+                payload["observation_id"]
+                if isinstance(payload.get("observation_id"), str)
+                else "",
+            )
+            or not all(
+                isinstance(payload.get(key), int) and not isinstance(payload.get(key), bool)
+                for key in ("screen_width", "screen_height", "x", "y")
+            )
+            or not isinstance(payload.get("target_bbox"), dict)
+        ):
+            return self._stale_click("Desktop click observation binding is invalid")
+
+        try:
+            expires_at = datetime.fromisoformat(payload["observation_expires_at"])
+            if expires_at.tzinfo is None or expires_at <= datetime.now(timezone.utc):
+                return self._stale_click("Desktop click observation expired")
+        except ValueError:
+            return self._stale_click("Desktop click observation timestamp is invalid")
+
+        values = (
+            payload.get("x"),
+            payload.get("y"),
+            payload.get("screen_width"),
+            payload.get("screen_height"),
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+            return self._stale_click("Approved click coordinates are invalid")
+        x, y, expected_width, expected_height = values
+        box = payload["target_bbox"]
+        if (
+            set(box) != {"x", "y", "width", "height"}
+            or any(
+                isinstance(box.get(key), bool) or not isinstance(box.get(key), int)
+                for key in ("x", "y", "width", "height")
+            )
+            or box["width"] <= 0
+            or box["height"] <= 0
+            or (x, y)
+            != (
+                int(box["x"] + box["width"] / 2),
+                int(box["y"] + box["height"] / 2),
+            )
+            or box["x"] < 0
+            or box["y"] < 0
+            or box["x"] + box["width"] > expected_width
+            or box["y"] + box["height"] > expected_height
+        ):
+            return self._stale_click("Approved desktop target geometry is invalid")
+        xdotool = shutil.which("xdotool")
+        if xdotool is None:
+            return self._stale_click("Fresh desktop observation is unavailable")
+        fresh = self._capture_screen()
+        if not fresh.get("success"):
+            return self._stale_click("Fresh desktop observation is unavailable")
+        if (
+            fresh.get("screen_width") != expected_width
+            or fresh.get("screen_height") != expected_height
+            or fresh.get("capture_sha256") != payload["observation_image_sha256"]
+            or fresh.get("active_window_identity") != payload["active_window_identity"]
+        ):
+            return self._stale_click("Desktop target changed after approval; create a new proposal")
+        try:
+            display = subprocess.run(
+                [xdotool, "getdisplaygeometry"],
+                check=True,
+                timeout=5,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).stdout.split()
+            if (
+                len(display) != 2
+                or int(display[0]) != expected_width
+                or int(display[1]) != expected_height
+                or not 0 <= x < expected_width
+                or not 0 <= y < expected_height
+            ):
+                return self._stale_click(
+                    "Screen changed after approval; create a new proposal"
+                )
+            if self._active_window_identity() != payload["active_window_identity"]:
+                return self._stale_click(
+                    "Active window changed after approval; create a new proposal"
+                )
+            subprocess.run(
+                [xdotool, "mousemove", "--sync", str(x), str(y), "click", "1"],
+                check=True,
+                timeout=5,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return {
+                "success": False,
+                "message": "Approved click could not be sent; do not retry",
+                "failure_code": "desktop_click_stale",
+            }
+        return {
+            "success": True,
+            "message": "Approved click sent",
+            "verification_status": "unverified",
+        }
+
+    @staticmethod
+    def _stale_click(message):
+        return {
+            "success": False,
+            "message": message,
+            "failure_code": "desktop_click_stale",
+        }
 
     def _read_file(self, relative_path: str) -> Dict[str, Any]:
         try:

@@ -21,6 +21,8 @@ jobs:
         run: python -m compileall -q .
       - name: Test self-healing retries
         run: python test_self_healing.py
+      - name: Test research report planning
+        run: python test_research_report.py
       - name: Test Local Agent command workflow
         run: python test_agent_commands.py
       - name: Test end-to-end Local Agent lifecycle
@@ -31,5 +33,15 @@ jobs:
         run: python test_agent_migrations.py
       - name: Test controlled desktop runtime
         run: python test_desktop_runtime.py
+      - name: Test computer vision
+        run: python test_vision_engine.py
+      - name: Test browser URL security
+        run: python test_browser_security.py
+      - name: Test isolated browser runtime
+        run: python test_browser_runtime.py
+      - name: Test computer action planner
+        run: python test_computer_planner.py
+      - name: Test computer approval and verification
+        run: python test_computer_use.py
       - name: Test customer ownership isolation
         run: python test_task_ownership.py
