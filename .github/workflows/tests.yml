@@ -23,5 +23,11 @@ jobs:
         run: python test_self_healing.py
       - name: Test Local Agent command workflow
         run: python test_agent_commands.py
+      - name: Test end-to-end Local Agent lifecycle
+        run: python test_agent_e2e.py
+      - name: Test Local Agent client protocol
+        run: python test_local_agent_client.py
+      - name: Test Local Agent schema migrations
+        run: python test_agent_migrations.py
       - name: Test customer ownership isolation
         run: python test_task_ownership.py

@@ -5,3 +5,4 @@ pwdlib[argon2]
 PyJWT
 python-dotenv
 pydantic
+websockets>=14,<16

@@ -1,12 +1,47 @@
 """Validation-only Local Agent protocol; desktop execution is intentionally disabled."""
 
+import json
 from typing import Any, Dict
 
 
+MAX_MESSAGE_BYTES = 8192
 ALLOWED_ACTIONS = {
     "open_app": {"app_id": {"calculator", "browser", "text_editor"}},
     "capture_screen": {},
 }
+
+
+def parse_message(message: Any) -> Dict[str, Any]:
+    if not isinstance(message, str):
+        raise ValueError("Message is invalid or too large")
+    try:
+        if len(message.encode("utf-8")) > MAX_MESSAGE_BYTES:
+            raise ValueError("Message is invalid or too large")
+    except UnicodeEncodeError as exc:
+        raise ValueError("Message is invalid or too large") from exc
+
+    def reject_duplicate_keys(pairs):
+        parsed = {}
+        for key, value in pairs:
+            if key in parsed:
+                raise ValueError("Duplicate JSON field")
+            parsed[key] = value
+        return parsed
+
+    def reject_constant(value):
+        raise ValueError(f"Invalid JSON constant: {value}")
+
+    try:
+        parsed = json.loads(
+            message,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_constant,
+        )
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("Message is not valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Message must be a JSON object")
+    return parsed
 
 
 def validate_command(command: Any) -> Dict[str, Any]:
@@ -23,14 +58,18 @@ def validate_command(command: Any) -> Dict[str, Any]:
         raise ValueError("Command fields are invalid")
     if command["type"] != "command":
         raise ValueError("Message type is invalid")
-    if not isinstance(command["command_id"], str) or not command["command_id"]:
+    if (
+        not isinstance(command["command_id"], str)
+        or not command["command_id"]
+        or len(command["command_id"]) > 64
+    ):
         raise ValueError("Command ID is invalid")
     if command["execution_enabled"] is not False:
         raise ValueError("Desktop execution is disabled")
 
     action = command["action"]
     payload = command["payload"]
-    if action not in ALLOWED_ACTIONS or not isinstance(payload, dict):
+    if not isinstance(action, str) or action not in ALLOWED_ACTIONS or not isinstance(payload, dict):
         raise ValueError("Action or payload is invalid")
 
     if action == "open_app":
