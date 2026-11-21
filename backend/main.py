@@ -3,18 +3,25 @@ from agent_executor import execute_agent, generate_plan, extract_handoff_context
 from research_report import build_research_task_plan
 from self_healing import analyze_failure, should_retry, execute_with_retries
 from auth import hash_password, verify_password, create_access_token, decode_access_token
+from local_agent_protocol import ALLOWED_ACTIONS as LOCAL_AGENT_ALLOWED_ACTIONS
+from local_agent_protocol import validate_command
 from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 import os
 import secrets
+import asyncio
+import hashlib
+import hmac
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Optional, List
+from pydantic import BaseModel, Field, StrictBool, StrictStr, ValidationError
+from typing import Optional, List, Dict, Any, Literal
 import sqlite3
 import uuid
 import json
+from datetime import datetime, timedelta, timezone
 
 
 app = FastAPI(
@@ -231,11 +238,148 @@ def init_db():
         """
     )
 
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_devices (
+            id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            credential_hash TEXT NOT NULL,
+            permissions TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'paired',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_safety (
+            owner_id TEXT PRIMARY KEY,
+            emergency_stopped INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_commands (
+            id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            client_request_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            deadline_at TEXT NOT NULL,
+            UNIQUE(owner_id, client_request_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_approvals (
+            id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            command_id TEXT NOT NULL UNIQUE,
+            token_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            consumed_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id TEXT NOT NULL,
+            device_id TEXT,
+            command_id TEXT,
+            event TEXT NOT NULL,
+            details TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_rate_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_commands_owner ON agent_commands(owner_id, created_at)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_approvals_owner ON agent_approvals(owner_id, status, expires_at)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_audit_owner ON agent_audit_log(owner_id, created_at)"
+    )
+
+    startup_time = datetime.now(timezone.utc).isoformat()
+    stale_commands = connection.execute(
+        """
+        SELECT id, owner_id, device_id, action FROM agent_commands
+        WHERE status = 'dispatched'
+        """
+    ).fetchall()
+    for row in stale_commands:
+        result = {
+            "command_id": row["id"],
+            "action": row["action"],
+            "success": False,
+            "message": "Backend restarted before receiving a Local Agent result",
+        }
+        connection.execute(
+            """
+            UPDATE agent_commands
+            SET status = 'failed', result = ?, updated_at = ?
+            WHERE id = ? AND status = 'dispatched'
+            """,
+            (json.dumps(result), startup_time, row["id"]),
+        )
+        connection.execute(
+            """
+            INSERT INTO agent_audit_log
+            (owner_id, device_id, command_id, event, details, created_at)
+            VALUES (?, ?, ?, 'command_failed', ?, ?)
+            """,
+            (
+                row["owner_id"],
+                row["device_id"],
+                row["id"],
+                json.dumps({"reason": "backend restarted"}),
+                startup_time,
+            ),
+        )
+    connection.execute(
+        "UPDATE agent_devices SET status = 'disconnected' WHERE status = 'connected'"
+    )
+
     connection.commit()
     connection.close()
 
 
 init_db()
+
+
+DESKTOP_EXECUTION_ENABLED = False
+AGENT_COMMAND_TIMEOUT_SECONDS = 15
+AGENT_APPROVAL_TTL_SECONDS = 300
+AGENT_REQUESTS_PER_MINUTE = 20
+ALLOWED_AGENT_ACTIONS = set(LOCAL_AGENT_ALLOWED_ACTIONS)
+AGENT_APP_ALLOWLIST = LOCAL_AGENT_ALLOWED_ACTIONS["open_app"]["app_id"]
+AGENT_CONNECTIONS = {}
+PENDING_AGENT_COMMANDS = {}
 
 
 # =========================
@@ -266,6 +410,40 @@ class CustomerRegister(BaseModel):
 class CustomerLogin(BaseModel):
     email: str = Field(min_length=5, max_length=254)
     password: str = Field(min_length=1, max_length=1024)
+
+
+class AgentDeviceCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    permissions: List[str] = Field(default_factory=list, max_length=2)
+
+    class Config:
+        extra = "forbid"
+
+
+class AgentCommandRequest(BaseModel):
+    action: Literal["open_app", "capture_screen"]
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    client_request_id: str = Field(min_length=16, max_length=128)
+
+    class Config:
+        extra = "forbid"
+
+
+class AgentApprovalDecision(BaseModel):
+    approval_token: StrictStr = Field(min_length=32, max_length=128)
+
+    class Config:
+        extra = "forbid"
+
+
+class AgentCommandResult(BaseModel):
+    command_id: StrictStr = Field(min_length=1, max_length=64)
+    action: Literal["open_app", "capture_screen"]
+    success: StrictBool
+    message: StrictStr = Field(min_length=1, max_length=500)
+
+    class Config:
+        extra = "forbid"
 
 
 class Task(BaseModel):
@@ -1435,4 +1613,1061 @@ def run_workforce(customer: dict = Depends(get_current_customer)):
         "executed": executed,
         "failed": failed,
         "blocked": blocked,
+    }
+
+
+# =========================
+# Paired Local Agent
+# =========================
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
+def _utc_text(value=None):
+    return (value or _utc_now()).isoformat()
+
+
+def _agent_audit(connection, owner_id, event, device_id=None, command_id=None, details=None):
+    connection.execute(
+        """
+        INSERT INTO agent_audit_log
+        (owner_id, device_id, command_id, event, details, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            owner_id,
+            device_id,
+            command_id,
+            event,
+            json.dumps(details or {}, separators=(",", ":"), sort_keys=True),
+            _utc_text(),
+        ),
+    )
+
+
+def _agent_safety_stopped(connection, owner_id):
+    row = connection.execute(
+        "SELECT emergency_stopped FROM agent_safety WHERE owner_id = ?",
+        (owner_id,),
+    ).fetchone()
+    return bool(row["emergency_stopped"]) if row else False
+
+
+def _validate_agent_action(action, payload):
+    if action not in ALLOWED_AGENT_ACTIONS or not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Action or payload is invalid")
+
+    if action == "open_app":
+        if (
+            set(payload) != {"app_id"}
+            or not isinstance(payload.get("app_id"), str)
+            or payload["app_id"] not in AGENT_APP_ALLOWLIST
+        ):
+            raise HTTPException(status_code=422, detail="Application is not allowlisted")
+    elif payload:
+        raise HTTPException(status_code=422, detail="capture_screen does not accept a payload")
+
+
+def _expire_agent_approvals(connection, owner_id):
+    now = _utc_text()
+    expired = connection.execute(
+        """
+        SELECT id, command_id FROM agent_approvals
+        WHERE owner_id = ? AND status = 'pending' AND expires_at <= ?
+        """,
+        (owner_id, now),
+    ).fetchall()
+    if expired:
+        connection.executemany(
+            """
+            UPDATE agent_approvals SET status = 'expired'
+            WHERE id = ? AND status = 'pending'
+            """,
+            [(row["id"],) for row in expired],
+        )
+        connection.executemany(
+            """
+            UPDATE agent_commands
+            SET status = 'expired', updated_at = ?
+            WHERE id = ? AND status = 'awaiting_approval'
+            """,
+            [(now, row["command_id"]) for row in expired],
+        )
+        for row in expired:
+            _agent_audit(
+                connection,
+                owner_id,
+                "approval_expired",
+                command_id=row["command_id"],
+            )
+
+
+def _wake_cancelled_agent_commands(owner_id, message, device_id=None):
+    connection = get_db()
+    try:
+        query = """
+            SELECT id, action FROM agent_commands
+            WHERE owner_id = ? AND status = 'cancelled'
+        """
+        params = [owner_id]
+        if device_id is not None:
+            query += " AND device_id = ?"
+            params.append(device_id)
+        rows = connection.execute(query, params).fetchall()
+    finally:
+        connection.close()
+
+    for row in rows:
+        future = PENDING_AGENT_COMMANDS.get(row["id"])
+        if future is not None and not future.done():
+            future.set_result({
+                "command_id": row["id"],
+                "action": row["action"],
+                "success": False,
+                "message": message,
+            })
+
+
+@app.post("/computer/agent/devices", status_code=201)
+def pair_agent_device(
+    request: AgentDeviceCreate,
+    customer: dict = Depends(get_current_customer),
+):
+    name = request.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Device name cannot be empty")
+    if len(set(request.permissions)) != len(request.permissions) or any(
+        permission not in ALLOWED_AGENT_ACTIONS for permission in request.permissions
+    ):
+        raise HTTPException(status_code=422, detail="Device permissions are invalid")
+
+    device_id = str(uuid.uuid4())
+    credential = secrets.token_urlsafe(32)
+    connection = get_db()
+    try:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO agent_devices
+                (id, owner_id, name, credential_hash, permissions, status)
+                VALUES (?, ?, ?, ?, ?, 'paired')
+                """,
+                (
+                    device_id,
+                    customer["id"],
+                    name,
+                    hashlib.sha256(credential.encode("utf-8")).hexdigest(),
+                    json.dumps(request.permissions),
+                ),
+            )
+            _agent_audit(
+                connection,
+                customer["id"],
+                "device_paired",
+                device_id=device_id,
+                details={"permissions": request.permissions},
+            )
+    finally:
+        connection.close()
+
+    return {
+        "device": {
+            "id": device_id,
+            "name": name,
+            "permissions": request.permissions,
+            "status": "paired",
+        },
+        "device_credential": credential,
+        "credential_notice": "Store this credential securely; it is shown only once.",
+    }
+
+
+@app.get("/computer/agent/devices")
+def list_agent_devices(customer: dict = Depends(get_current_customer)):
+    connection = get_db()
+    try:
+        rows = connection.execute(
+            """
+            SELECT id, name, permissions, status, created_at, last_seen_at
+            FROM agent_devices WHERE owner_id = ? ORDER BY created_at DESC
+            """,
+            (customer["id"],),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    return {
+        "devices": [
+            {
+                **dict(row),
+                "permissions": json.loads(row["permissions"]),
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.post("/computer/agent/devices/{device_id}/revoke")
+async def revoke_agent_device(
+    device_id: str,
+    customer: dict = Depends(get_current_customer),
+):
+    connection = get_db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        device = connection.execute(
+            "SELECT id FROM agent_devices WHERE id = ? AND owner_id = ?",
+            (device_id, customer["id"]),
+        ).fetchone()
+        if device is None:
+            connection.rollback()
+            raise HTTPException(status_code=404, detail="Device not found")
+        connection.execute(
+            "UPDATE agent_devices SET status = 'revoked' WHERE id = ? AND owner_id = ?",
+            (device_id, customer["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE agent_approvals SET status = 'denied', consumed_at = ?
+            WHERE owner_id = ? AND status = 'pending'
+              AND command_id IN (
+                  SELECT id FROM agent_commands
+                  WHERE device_id = ? AND status = 'awaiting_approval'
+              )
+            """,
+            (_utc_text(), customer["id"], device_id),
+        )
+        connection.execute(
+            """
+            UPDATE agent_commands
+            SET status = 'cancelled', updated_at = ?
+            WHERE owner_id = ? AND device_id = ?
+              AND status IN ('awaiting_approval', 'dispatched')
+            """,
+            (_utc_text(), customer["id"], device_id),
+        )
+        _agent_audit(
+            connection,
+            customer["id"],
+            "device_revoked",
+            device_id=device_id,
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    websocket = AGENT_CONNECTIONS.pop(device_id, None)
+    connection_closed = True
+    if websocket is not None:
+        try:
+            await websocket.close(code=1008, reason="Device revoked")
+        except (RuntimeError, WebSocketDisconnect):
+            connection_closed = False
+            connection = get_db()
+            try:
+                with connection:
+                    _agent_audit(
+                        connection,
+                        customer["id"],
+                        "device_socket_close_failed",
+                        device_id=device_id,
+                    )
+            finally:
+                connection.close()
+
+    _wake_cancelled_agent_commands(
+        customer["id"],
+        "Device was revoked",
+        device_id=device_id,
+    )
+
+    return {
+        "device_id": device_id,
+        "status": "revoked",
+        "connection_closed": connection_closed,
+    }
+
+
+@app.post("/computer/agent/emergency-stop")
+async def emergency_stop(customer: dict = Depends(get_current_customer)):
+    connection = get_db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            INSERT INTO agent_safety (owner_id, emergency_stopped, updated_at)
+            VALUES (?, 1, ?)
+            ON CONFLICT(owner_id) DO UPDATE SET
+                emergency_stopped = 1, updated_at = excluded.updated_at
+            """,
+            (customer["id"], _utc_text()),
+        )
+        connection.execute(
+            """
+            UPDATE agent_approvals
+            SET status = 'denied', consumed_at = ?
+            WHERE owner_id = ? AND status = 'pending'
+            """,
+            (_utc_text(), customer["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE agent_commands
+            SET status = 'cancelled', updated_at = ?
+            WHERE owner_id = ? AND status IN ('awaiting_approval', 'dispatched')
+            """,
+            (_utc_text(), customer["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE agent_devices SET status = 'disconnected'
+            WHERE owner_id = ? AND status = 'connected'
+            """,
+            (customer["id"],),
+        )
+        _agent_audit(connection, customer["id"], "emergency_stop")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    owned_connections = []
+    connection = get_db()
+    try:
+        rows = connection.execute(
+            "SELECT id FROM agent_devices WHERE owner_id = ?",
+            (customer["id"],),
+        ).fetchall()
+    finally:
+        connection.close()
+    for row in rows:
+        websocket = AGENT_CONNECTIONS.pop(row["id"], None)
+        if websocket is not None:
+            owned_connections.append(websocket)
+    failed_closes = 0
+    for websocket in owned_connections:
+        try:
+            await websocket.close(code=1008, reason="Emergency stop")
+        except (RuntimeError, WebSocketDisconnect):
+            failed_closes += 1
+
+    if failed_closes:
+        connection = get_db()
+        try:
+            with connection:
+                _agent_audit(
+                    connection,
+                    customer["id"],
+                    "emergency_stop_socket_close_failed",
+                    details={"count": failed_closes},
+                )
+        finally:
+            connection.close()
+
+    _wake_cancelled_agent_commands(customer["id"], "Emergency stop activated")
+
+    return {"status": "stopped", "message": "All Local Agent commands were stopped"}
+
+
+@app.post("/computer/agent/emergency-stop/reset")
+def reset_emergency_stop(customer: dict = Depends(get_current_customer)):
+    connection = get_db()
+    try:
+        with connection:
+            connection.execute(
+                """
+                UPDATE agent_safety SET emergency_stopped = 0, updated_at = ?
+                WHERE owner_id = ?
+                """,
+                (_utc_text(), customer["id"]),
+            )
+            _agent_audit(connection, customer["id"], "emergency_stop_reset")
+    finally:
+        connection.close()
+    return {"status": "active", "message": "Emergency stop reset; devices must reconnect"}
+
+
+@app.post("/computer/agent/devices/{device_id}/commands", status_code=202)
+def request_agent_command(
+    device_id: str,
+    request: AgentCommandRequest,
+    customer: dict = Depends(get_current_customer),
+):
+    _validate_agent_action(request.action, request.payload)
+    connection = get_db()
+    try:
+        device = connection.execute(
+            """
+            SELECT id, permissions, status FROM agent_devices
+            WHERE id = ? AND owner_id = ?
+            """,
+            (device_id, customer["id"]),
+        ).fetchone()
+        if device is None:
+            raise HTTPException(status_code=404, detail="Device not found")
+        if _agent_safety_stopped(connection, customer["id"]):
+            _agent_audit(connection, customer["id"], "command_rejected_emergency_stop", device_id=device_id)
+            connection.commit()
+            raise HTTPException(status_code=423, detail="Emergency stop is active")
+        if device["status"] != "connected" or device_id not in AGENT_CONNECTIONS:
+            _agent_audit(connection, customer["id"], "command_rejected_disconnected", device_id=device_id)
+            connection.commit()
+            raise HTTPException(status_code=409, detail="Device is not connected")
+
+        permissions = json.loads(device["permissions"])
+        if request.action not in permissions:
+            _agent_audit(
+                connection,
+                customer["id"],
+                "command_rejected_permission",
+                device_id=device_id,
+                details={"action": request.action},
+            )
+            connection.commit()
+            raise HTTPException(status_code=403, detail="Device does not permit this action")
+
+        now = _utc_now()
+        cutoff = _utc_text(now - timedelta(minutes=1))
+        count = connection.execute(
+            """
+            SELECT COUNT(*) FROM agent_rate_events
+            WHERE owner_id = ? AND created_at >= ?
+            """,
+            (customer["id"], cutoff),
+        ).fetchone()[0]
+        if count >= AGENT_REQUESTS_PER_MINUTE:
+            _agent_audit(connection, customer["id"], "command_rate_limited", device_id=device_id)
+            connection.commit()
+            raise HTTPException(status_code=429, detail="Command rate limit exceeded")
+        connection.execute(
+            "DELETE FROM agent_rate_events WHERE created_at < ?",
+            (cutoff,),
+        )
+
+        command_id = str(uuid.uuid4())
+        approval_id = str(uuid.uuid4())
+        approval_token = secrets.token_urlsafe(32)
+        expires_at = _utc_text(now + timedelta(seconds=AGENT_APPROVAL_TTL_SECONDS))
+        try:
+            connection.execute(
+                """
+                INSERT INTO agent_commands
+                (id, owner_id, device_id, client_request_id, action, payload,
+                 status, created_at, updated_at, deadline_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'awaiting_approval', ?, ?, ?)
+                """,
+                (
+                    command_id,
+                    customer["id"],
+                    device_id,
+                    request.client_request_id,
+                    request.action,
+                    json.dumps(request.payload, separators=(",", ":"), sort_keys=True),
+                    _utc_text(now),
+                    _utc_text(now),
+                    expires_at,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            connection.rollback()
+            raise HTTPException(status_code=409, detail="Request ID has already been used")
+        connection.execute(
+            """
+            INSERT INTO agent_approvals
+            (id, owner_id, command_id, token_hash, status, expires_at, created_at)
+            VALUES (?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                approval_id,
+                customer["id"],
+                command_id,
+                hashlib.sha256(approval_token.encode("utf-8")).hexdigest(),
+                expires_at,
+                _utc_text(now),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO agent_rate_events (owner_id, created_at) VALUES (?, ?)",
+            (customer["id"], _utc_text(now)),
+        )
+        _agent_audit(
+            connection,
+            customer["id"],
+            "command_requested",
+            device_id=device_id,
+            command_id=command_id,
+            details={"action": request.action},
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    return {
+        "command_id": command_id,
+        "status": "awaiting_approval",
+        "approval": {
+            "request_id": approval_id,
+            "expires_at": expires_at,
+            "approval_token": approval_token,
+        },
+        "execution_enabled": DESKTOP_EXECUTION_ENABLED,
+    }
+
+
+@app.get("/computer/agent/approvals")
+def list_agent_approvals(customer: dict = Depends(get_current_customer)):
+    connection = get_db()
+    try:
+        with connection:
+            _expire_agent_approvals(connection, customer["id"])
+        rows = connection.execute(
+            """
+            SELECT a.id AS request_id, a.command_id, a.expires_at, a.created_at,
+                   c.device_id, c.action, c.payload
+            FROM agent_approvals a
+            JOIN agent_commands c ON c.id = a.command_id
+            WHERE a.owner_id = ? AND a.status = 'pending'
+            ORDER BY a.created_at ASC
+            """,
+            (customer["id"],),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    return {
+        "approvals": [
+            {
+                **dict(row),
+                "payload": json.loads(row["payload"]),
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.post("/computer/agent/approvals/{request_id}/deny")
+def deny_agent_approval(
+    request_id: str,
+    decision: AgentApprovalDecision,
+    customer: dict = Depends(get_current_customer),
+):
+    supplied_hash = hashlib.sha256(decision.approval_token.encode("utf-8")).hexdigest()
+    connection = get_db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        approval = connection.execute(
+            """
+            SELECT id, command_id, token_hash, expires_at FROM agent_approvals
+            WHERE id = ? AND owner_id = ? AND status = 'pending'
+            """,
+            (request_id, customer["id"]),
+        ).fetchone()
+        if approval is None:
+            connection.rollback()
+            raise HTTPException(status_code=404, detail="Approval request not found")
+        if not hmac.compare_digest(supplied_hash, approval["token_hash"]):
+            connection.rollback()
+            raise HTTPException(status_code=403, detail="Invalid approval token")
+        now = _utc_text()
+        if approval["expires_at"] <= now:
+            connection.execute(
+                "UPDATE agent_approvals SET status = 'expired' WHERE id = ?",
+                (request_id,),
+            )
+            connection.execute(
+                """
+                UPDATE agent_commands SET status = 'expired', updated_at = ?
+                WHERE id = ? AND owner_id = ?
+                """,
+                (now, approval["command_id"], customer["id"]),
+            )
+            connection.commit()
+            raise HTTPException(status_code=409, detail="Approval request has expired")
+        connection.execute(
+            """
+            UPDATE agent_approvals SET status = 'denied', consumed_at = ?
+            WHERE id = ? AND owner_id = ? AND status = 'pending'
+            """,
+            (now, request_id, customer["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE agent_commands SET status = 'denied', updated_at = ?
+            WHERE id = ? AND owner_id = ? AND status = 'awaiting_approval'
+            """,
+            (now, approval["command_id"], customer["id"]),
+        )
+        _agent_audit(
+            connection,
+            customer["id"],
+            "command_denied",
+            command_id=approval["command_id"],
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    return {"request_id": request_id, "command_id": approval["command_id"], "status": "denied"}
+
+
+@app.post("/computer/agent/approvals/{request_id}/approve")
+async def approve_agent_command(
+    request_id: str,
+    decision: AgentApprovalDecision,
+    customer: dict = Depends(get_current_customer),
+):
+    supplied_hash = hashlib.sha256(decision.approval_token.encode("utf-8")).hexdigest()
+    connection = get_db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        approval = connection.execute(
+            """
+            SELECT a.id, a.command_id, a.token_hash, a.expires_at,
+                   c.device_id, c.action, c.payload
+            FROM agent_approvals a
+            JOIN agent_commands c ON c.id = a.command_id
+            WHERE a.id = ? AND a.owner_id = ? AND a.status = 'pending'
+              AND c.owner_id = ?
+            """,
+            (request_id, customer["id"], customer["id"]),
+        ).fetchone()
+        if approval is None:
+            connection.rollback()
+            raise HTTPException(status_code=404, detail="Approval request not found")
+        if not hmac.compare_digest(supplied_hash, approval["token_hash"]):
+            connection.rollback()
+            raise HTTPException(status_code=403, detail="Invalid approval token")
+        now = _utc_text()
+        if approval["expires_at"] <= now:
+            connection.execute(
+                "UPDATE agent_approvals SET status = 'expired' WHERE id = ?",
+                (request_id,),
+            )
+            connection.execute(
+                """
+                UPDATE agent_commands SET status = 'expired', updated_at = ?
+                WHERE id = ? AND owner_id = ?
+                """,
+                (now, approval["command_id"], customer["id"]),
+            )
+            connection.commit()
+            raise HTTPException(status_code=409, detail="Approval request has expired")
+
+        device = connection.execute(
+            """
+            SELECT status, permissions FROM agent_devices
+            WHERE id = ? AND owner_id = ?
+            """,
+            (approval["device_id"], customer["id"]),
+        ).fetchone()
+        if (
+            device is None
+            or device["status"] != "connected"
+            or approval["device_id"] not in AGENT_CONNECTIONS
+        ):
+            connection.rollback()
+            raise HTTPException(status_code=409, detail="Device is not connected")
+        if _agent_safety_stopped(connection, customer["id"]):
+            connection.rollback()
+            raise HTTPException(status_code=423, detail="Emergency stop is active")
+        if approval["action"] not in json.loads(device["permissions"]):
+            connection.rollback()
+            raise HTTPException(status_code=403, detail="Device no longer permits this action")
+
+        deadline = _utc_text(_utc_now() + timedelta(seconds=AGENT_COMMAND_TIMEOUT_SECONDS))
+        connection.execute(
+            """
+            UPDATE agent_approvals SET status = 'approved', consumed_at = ?
+            WHERE id = ? AND owner_id = ? AND status = 'pending'
+            """,
+            (now, request_id, customer["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE agent_commands SET status = 'dispatched', updated_at = ?, deadline_at = ?
+            WHERE id = ? AND owner_id = ? AND status = 'awaiting_approval'
+            """,
+            (now, deadline, approval["command_id"], customer["id"]),
+        )
+        _agent_audit(
+            connection,
+            customer["id"],
+            "command_approved_and_dispatched",
+            device_id=approval["device_id"],
+            command_id=approval["command_id"],
+            details={"execution_enabled": DESKTOP_EXECUTION_ENABLED},
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    command = {
+        "type": "command",
+        "command_id": approval["command_id"],
+        "action": approval["action"],
+        "payload": json.loads(approval["payload"]),
+        "execution_enabled": DESKTOP_EXECUTION_ENABLED,
+    }
+    try:
+        validate_command(command)
+    except ValueError:
+        _fail_agent_command(approval["command_id"], customer["id"], "Command validation failed")
+        raise HTTPException(status_code=422, detail="Command failed Local Agent validation")
+
+    websocket = AGENT_CONNECTIONS.get(approval["device_id"])
+    if websocket is None:
+        _fail_agent_command(approval["command_id"], customer["id"], "Device disconnected before dispatch")
+        raise HTTPException(status_code=409, detail="Device disconnected before dispatch")
+
+    loop = asyncio.get_running_loop()
+    response_future = loop.create_future()
+    PENDING_AGENT_COMMANDS[approval["command_id"]] = response_future
+    try:
+        await websocket.send_json(command)
+        result = await asyncio.wait_for(
+            response_future,
+            timeout=AGENT_COMMAND_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        _fail_agent_command(
+            approval["command_id"],
+            customer["id"],
+            "Approval request was interrupted",
+        )
+        raise
+    except asyncio.TimeoutError:
+        _fail_agent_command(approval["command_id"], customer["id"], "Local Agent response timed out")
+        result = {
+            "command_id": approval["command_id"],
+            "action": approval["action"],
+            "success": False,
+            "message": "Local Agent response timed out",
+        }
+    except Exception:
+        _fail_agent_command(approval["command_id"], customer["id"], "Local Agent dispatch failed")
+        result = {
+            "command_id": approval["command_id"],
+            "action": approval["action"],
+            "success": False,
+            "message": "Local Agent dispatch failed",
+        }
+    finally:
+        PENDING_AGENT_COMMANDS.pop(approval["command_id"], None)
+
+    return {
+        "request_id": request_id,
+        "command_id": approval["command_id"],
+        "status": "failed" if not result["success"] else "completed",
+        "result": result,
+        "execution_enabled": DESKTOP_EXECUTION_ENABLED,
+    }
+
+
+def _fail_agent_command(command_id, owner_id, message):
+    connection = get_db()
+    try:
+        with connection:
+            row = connection.execute(
+                """
+                SELECT device_id, action FROM agent_commands
+                WHERE id = ? AND owner_id = ? AND status = 'dispatched'
+                """,
+                (command_id, owner_id),
+            ).fetchone()
+            if row is None:
+                return
+            result = {
+                "command_id": command_id,
+                "action": row["action"],
+                "success": False,
+                "message": message,
+            }
+            connection.execute(
+                """
+                UPDATE agent_commands SET status = 'failed', result = ?, updated_at = ?
+                WHERE id = ? AND owner_id = ? AND status = 'dispatched'
+                """,
+                (json.dumps(result), _utc_text(), command_id, owner_id),
+            )
+            _agent_audit(
+                connection,
+                owner_id,
+                "command_failed",
+                device_id=row["device_id"],
+                command_id=command_id,
+                details={"reason": message},
+            )
+    finally:
+        connection.close()
+
+
+async def _record_agent_result(device_id, incoming):
+    connection = get_db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        command = connection.execute(
+            """
+            SELECT id, owner_id, action, deadline_at
+            FROM agent_commands
+            WHERE id = ? AND device_id = ? AND status = 'dispatched'
+            """,
+            (incoming.command_id, device_id),
+        ).fetchone()
+        if command is None or command["action"] != incoming.action or command["deadline_at"] <= _utc_text():
+            device = connection.execute(
+                "SELECT owner_id FROM agent_devices WHERE id = ?",
+                (device_id,),
+            ).fetchone()
+            if device is not None:
+                _agent_audit(
+                    connection,
+                    device["owner_id"],
+                    "agent_response_rejected",
+                    device_id=device_id,
+                    command_id=incoming.command_id,
+                    details={"reason": "unsolicited, mismatched, or expired response"},
+                )
+                connection.commit()
+            else:
+                connection.rollback()
+            return False
+
+        device = connection.execute(
+            """
+            SELECT status FROM agent_devices
+            WHERE id = ? AND owner_id = ?
+            """,
+            (device_id, command["owner_id"]),
+        ).fetchone()
+        if (
+            device is None
+            or device["status"] != "connected"
+            or _agent_safety_stopped(connection, command["owner_id"])
+        ):
+            _agent_audit(
+                connection,
+                command["owner_id"],
+                "agent_response_rejected",
+                device_id=device_id,
+                command_id=incoming.command_id,
+                details={"reason": "device revoked, disconnected, or emergency stop active"},
+            )
+            connection.commit()
+            return False
+
+        result = {
+            "command_id": incoming.command_id,
+            "action": incoming.action,
+            "success": False,
+            "message": "Desktop execution is disabled; Local Agent result was not accepted as execution.",
+        }
+        connection.execute(
+            """
+            UPDATE agent_commands SET status = 'failed', result = ?, updated_at = ?
+            WHERE id = ? AND owner_id = ? AND device_id = ? AND status = 'dispatched'
+            """,
+            (
+                json.dumps(result),
+                _utc_text(),
+                incoming.command_id,
+                command["owner_id"],
+                device_id,
+            ),
+        )
+        _agent_audit(
+            connection,
+            command["owner_id"],
+            "agent_response_recorded_execution_disabled",
+            device_id=device_id,
+            command_id=incoming.command_id,
+            details={"agent_claimed_success": incoming.success},
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    future = PENDING_AGENT_COMMANDS.get(incoming.command_id)
+    if future is not None and not future.done():
+        future.set_result(result)
+    return True
+
+
+@app.websocket("/computer/agent/ws/{device_id}")
+async def local_agent_websocket(websocket: WebSocket, device_id: str):
+    await websocket.accept()
+    owner_id = None
+    try:
+        mode = os.getenv("NEX_ENV", "production").strip().lower()
+        if mode != "development" and websocket.url.scheme != "wss":
+            await websocket.close(code=1008, reason="Secure WebSocket is required")
+            return
+        auth_message = await asyncio.wait_for(websocket.receive_json(), timeout=10)
+        if (
+            not isinstance(auth_message, dict)
+            or set(auth_message) != {"type", "credential"}
+            or auth_message.get("type") != "authenticate"
+            or not isinstance(auth_message.get("credential"), str)
+        ):
+            await websocket.close(code=1008, reason="Invalid authentication message")
+            return
+
+        connection = get_db()
+        try:
+            device = connection.execute(
+                """
+                SELECT owner_id, credential_hash, status
+                FROM agent_devices WHERE id = ?
+                """,
+                (device_id,),
+            ).fetchone()
+            if device is None:
+                await websocket.close(code=1008, reason="Unknown device")
+                return
+            owner_id = device["owner_id"]
+            supplied_hash = hashlib.sha256(auth_message["credential"].encode("utf-8")).hexdigest()
+            if (
+                not hmac.compare_digest(supplied_hash, device["credential_hash"])
+                or device["status"] == "revoked"
+                or _agent_safety_stopped(connection, owner_id)
+            ):
+                _agent_audit(
+                    connection,
+                    owner_id,
+                    "agent_authentication_rejected",
+                    device_id=device_id,
+                )
+                connection.commit()
+                await websocket.close(code=1008, reason="Device authentication failed")
+                return
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE agent_devices SET status = 'connected', last_seen_at = ?
+                    WHERE id = ? AND owner_id = ? AND status != 'revoked'
+                    """,
+                    (_utc_text(), device_id, owner_id),
+                )
+                _agent_audit(connection, owner_id, "agent_connected", device_id=device_id)
+        finally:
+            connection.close()
+
+        previous_connection = AGENT_CONNECTIONS.get(device_id)
+        AGENT_CONNECTIONS[device_id] = websocket
+        if previous_connection is not None:
+            await previous_connection.close(code=1008, reason="Replaced by a new connection")
+        await websocket.send_json({"type": "authenticated", "device_id": device_id})
+        while True:
+            raw_result = await websocket.receive_json()
+            try:
+                incoming = AgentCommandResult.parse_obj(raw_result)
+            except ValidationError:
+                connection = get_db()
+                try:
+                    with connection:
+                        _agent_audit(
+                            connection,
+                            owner_id,
+                            "agent_response_rejected",
+                            device_id=device_id,
+                            details={"reason": "invalid result payload"},
+                        )
+                finally:
+                    connection.close()
+                await websocket.close(code=1008, reason="Invalid command result")
+                return
+            if not await _record_agent_result(device_id, incoming):
+                await websocket.close(code=1008, reason="Unsolicited or invalid command result")
+                return
+            await websocket.send_json({
+                "type": "result_ack",
+                "command_id": incoming.command_id,
+                "accepted": True,
+            })
+    except (WebSocketDisconnect, asyncio.TimeoutError):
+        pass
+    finally:
+        if AGENT_CONNECTIONS.get(device_id) is websocket:
+            AGENT_CONNECTIONS.pop(device_id, None)
+            connection = get_db()
+            try:
+                with connection:
+                    connection.execute(
+                        """
+                        UPDATE agent_devices SET status = 'disconnected'
+                        WHERE id = ? AND owner_id = ? AND status = 'connected'
+                        """,
+                        (device_id, owner_id),
+                    )
+                    if owner_id:
+                        _agent_audit(connection, owner_id, "agent_disconnected", device_id=device_id)
+            finally:
+                connection.close()
+
+
+@app.get("/computer/agent/commands")
+def list_agent_commands(customer: dict = Depends(get_current_customer)):
+    connection = get_db()
+    try:
+        rows = connection.execute(
+            """
+            SELECT id AS command_id, device_id, action, payload, status,
+                   result, created_at, updated_at
+            FROM agent_commands WHERE owner_id = ?
+            ORDER BY created_at DESC LIMIT 100
+            """,
+            (customer["id"],),
+        ).fetchall()
+    finally:
+        connection.close()
+    return {
+        "commands": [
+            {
+                **dict(row),
+                "payload": json.loads(row["payload"]),
+                "result": json.loads(row["result"]) if row["result"] else None,
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.get("/computer/agent/commands/{command_id}")
+def get_agent_command(
+    command_id: str,
+    customer: dict = Depends(get_current_customer),
+):
+    connection = get_db()
+    try:
+        row = connection.execute(
+            """
+            SELECT id AS command_id, device_id, action, payload, status,
+                   result, created_at, updated_at, deadline_at
+            FROM agent_commands WHERE id = ? AND owner_id = ?
+            """,
+            (command_id, customer["id"]),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Command not found")
+    return {
+        **dict(row),
+        "payload": json.loads(row["payload"]),
+        "result": json.loads(row["result"]) if row["result"] else None,
+        "execution_enabled": DESKTOP_EXECUTION_ENABLED,
     }
